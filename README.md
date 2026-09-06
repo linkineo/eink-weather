@@ -43,15 +43,22 @@ The default serial port is `/dev/cu.usbserial-110`; override it with
 ## Repository layout
 
 ```
-CMakeLists.txt         project definition (wave 1 restricts COMPONENTS to main)
+CMakeLists.txt         project definition
 sdkconfig.defaults     target, flash and console settings
 main/                  application: app_main.c, board.h, test_log.h
-components/gfx/        framebuffer and drawing primitives (to be added)
-components/epd_uc8179/ UC8179 panel driver (to be added)
+components/gfx/        1-bpp framebuffer and drawing primitives
+                       (vendored Waveshare GUI_Paint + STM fonts, gfx_* helpers)
+components/epd_uc8179/ UC8179 panel driver: 3-wire SPI bus, probe,
+                       init / display / sleep sequences (Kconfig: panel variant,
+                       BUSY timeout, SPI clock)
 tools/env.sh           sourced: activates the ESP-IDF toolchain
 tools/flash.sh         build + flash (+ optional capture)
 tools/capture.py       non-interactive UART capture for automated checks
 ```
+
+The firmware performs **exactly one panel refresh per boot** and puts the panel
+back into deep sleep afterwards, on every exit path (Waveshare rule: a panel
+left powered is damaged by the sustained high voltage).
 
 ## Log contract
 
@@ -59,9 +66,25 @@ The firmware prints machine-readable lines prefixed with `[EPD-TEST] `
 (see `main/test_log.h`). `tools/capture.py` parses them:
 
 - `[EPD-TEST] boot chip=... mac=... idf=... reset=... heap=...` — boot banner
+- `[EPD-TEST] probe verdict=PRESENT|ABSENT|UNCERTAIN chip_rev=0x.. prod=..
+  lut=.. flg=0x.. temp=..C pbc=.. busy_after_reset=. busy_low_ms=..
+  busy_release_ms=..` — controller probe (one line). `busy_low_ms` /
+  `busy_release_ms` are the low-then-high BUSY signature after power-on: both
+  ≥ 0 means the controller answered. The verdict is informational only; the
+  refresh is attempted whatever it says.
+- `[EPD-TEST] init ok` — panel initialisation sequence completed
+- `[EPD-TEST] refresh_ms=N` — wall-clock duration of the one full refresh
+  (≈ 15000–25000 ms on the tri-colour panel, ≈ 4000 ms would mean a b/w LUT)
+- `[EPD-TEST] sleep ok` — panel back in deep sleep
 - `[EPD-TEST] DONE` — success marker, capture stops here (exit 0)
-- `[EPD-TEST] ERROR ...` — failure marker (exit 1)
+- `[EPD-TEST] ERROR stage=bus|init|display|sleep err=ESP_ERR_...` — failure
+  marker (exit 1); `stage=display err=ESP_ERR_TIMEOUT` means BUSY never
+  released
 - `[EPD-TEST] alive uptime=Ns heap=N` — heartbeat every 10 s
+
+Only `app_main` prints `[EPD-TEST]` lines; the driver logs through `ESP_LOG*`
+under the `epd` tag (power-on, refresh and power-off BUSY durations), so the
+two streams never interleave inside one line.
 
 Capture exit codes: 0 ok, 1 error marker, 2 timeout, 3 pyserial missing,
 4 a `--expect` substring never appeared.

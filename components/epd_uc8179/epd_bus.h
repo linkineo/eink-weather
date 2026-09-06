@@ -45,7 +45,8 @@ esp_err_t epd_bus_data_inv(const uint8_t *src, size_t n);
  * then a receive-only phase with DC high. n must be <= 8. */
 esp_err_t epd_bus_read(uint8_t cmd, uint8_t *out, size_t n);
 
-/* Hardware reset pulse: RST high 20 ms, low 2 ms, high 20 ms. */
+/* Hardware reset pulse: RST high 200 ms, low 5 ms, high 200 ms -- the timing
+ * of the tri-colour reference driver EPD_7in5b_V2.c:40-48. */
 void epd_bus_reset_pulse(void);
 
 /* Current level of the BUSY_N line: 0 = busy, 1 = idle. */

@@ -22,14 +22,17 @@ static const char *TAG = "epd";
 #define EPD_DC_DATA       1
 #define EPD_BUSY_POLL_MS  5
 
-/* Reset pulse timing, transcribed from EPD_7in5_V2.c:38-46 (EPD_Reset).
- * Note the Waveshare references disagree: the tri-colour Raspberry Pi driver
- * (EPD_7in5b_V2.c:40-48) uses 200 ms / 5 ms / 200 ms and the tri-colour ESP32
- * one (EPD_7in5b_V2.cpp:37-45) 200 ms / 2 ms / 200 ms. The spec gives no
- * minimum RST_N pulse width, so if the panel does not come up reliably at
- * bring-up, raise EPD_RST_HIGH_MS to 200 first. */
-#define EPD_RST_HIGH_MS   20
-#define EPD_RST_LOW_MS    2
+/* Reset pulse timing, transcribed from the tri-colour Raspberry Pi reference
+ * driver EPD_7in5b_V2.c:40-48 (EPD_Reset): DEV_Delay_ms(200) / 5 / 200.
+ * The Waveshare references disagree with each other -- the black/white driver
+ * EPD_7in5_V2.c:38-46 uses 20 ms / 2 ms / 20 ms and the tri-colour ESP32 port
+ * EPD_7in5b_V2.cpp:37-45 uses 200 ms / 2 ms / 200 ms -- and the spec gives no
+ * minimum RST_N pulse width. The panel actually fitted here is the tri-colour
+ * one, so wave 2 follows its own reference: the longest, most conservative
+ * timing. The cost is 400 ms per reset, paid twice per boot (probe + init),
+ * which is negligible next to a 15-25 s refresh. */
+#define EPD_RST_HIGH_MS   200
+#define EPD_RST_LOW_MS    5
 
 typedef struct {
     spi_device_handle_t dev;
