@@ -1,10 +1,11 @@
 /*
  * app_main.c - hardware bring-up firmware.
  *
- * Boot banner on UART, then the wave-2 display bring-up: SPI bus, controller
- * probe, panel init, one composed "Hello, World!" image, panel back to deep
- * sleep. Exactly ONE panel refresh per boot (Waveshare rule: never leave the
- * panel powered, keep refreshes rare), then a heartbeat every 10 s forever.
+ * Boot banner on UART, then the display bring-up: controller probe (bit-banged
+ * GPIO, must precede the bus), write path, panel init, one composed
+ * "Hello, World!" image, panel back to deep sleep. Exactly ONE panel refresh
+ * per boot (Waveshare rule: never leave the panel powered, keep refreshes
+ * rare), then a heartbeat every 10 s forever.
  *
  * All machine-readable output follows the log contract in test_log.h, and
  * every [EPD-TEST] line is printed from this task only - the driver logs
@@ -250,13 +251,26 @@ static void compose_black(const epd_probe_result_t *probe)
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
 
-    snprintf(buf, sizeof(buf), "Panel %s  chip_rev 0x%02X",
-             epd_panel_name(), probe->rev[6]);
+    /* chip_rev and the temperature come from register reads. When those come
+     * back from an undriven line (probe->reads_ok false) they are garbage, so
+     * the panel says n/a rather than showing a number that looks real. */
+    char chip_rev[8];
+    char temp[8];
+    if (probe->reads_ok) {
+        snprintf(chip_rev, sizeof(chip_rev), "0x%02X", probe->rev[6]);
+        snprintf(temp, sizeof(temp), "%dC", (int)probe->temp_c);
+    } else {
+        snprintf(chip_rev, sizeof(chip_rev), "n/a");
+        snprintf(temp, sizeof(temp), "n/a");
+    }
+
+    snprintf(buf, sizeof(buf), "Panel %s  chip_rev %s",
+             epd_panel_name(), chip_rev);
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
 
-    snprintf(buf, sizeof(buf), "probe %s  T=%dC  busy %d/%d ms",
-             probe->verdict, (int)probe->temp_c,
+    snprintf(buf, sizeof(buf), "probe %s  T=%s  busy %d/%d ms",
+             probe->verdict, temp,
              probe->busy_low_ms, probe->busy_release_ms);
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
@@ -322,21 +336,19 @@ static esp_err_t display_bringup(void)
         .spi_hz = BOARD_EPD_SPI_HZ,
     };
 
-    esp_err_t err = epd_bus_init(&pins);
-    if (err != ESP_OK) {
-        EPD_TEST_LOG("ERROR stage=bus err=%s", esp_err_to_name(err));
-        return err;
-    }
-
     /*
-     * The probe is informational: a UC8179 whose register reads come back as
-     * 0xFF can still drive the panel perfectly, so the refresh is attempted
+     * The probe runs first and on bit-banged GPIO: it reads registers, which
+     * the SPI peripheral cannot do on this 3-wire bus, and it releases
+     * SCK/MOSI/CS again on the way out so epd_bus_init() can claim them.
+     *
+     * It is informational: a UC8179 whose register reads come back as 0xFF
+     * can still drive the panel perfectly, so the refresh is attempted
      * whatever the verdict. A transport-level failure is reported through
      * ESP_LOGW rather than an [EPD-TEST] ERROR line, which would stop the
      * capture before the refresh that this run is about.
      */
     epd_probe_result_t probe;
-    esp_err_t probe_err = epd_probe(&probe);
+    esp_err_t probe_err = epd_probe(&pins, &probe);
     if (probe_err != ESP_OK) {
         ESP_LOGW(TAG, "epd_probe() failed: %s (continuing anyway)",
                  esp_err_to_name(probe_err));
@@ -345,6 +357,12 @@ static esp_err_t display_bringup(void)
     char line[192];
     epd_probe_format(&probe, line, sizeof(line));
     EPD_TEST_LOG("%s", line);
+
+    esp_err_t err = epd_bus_init(&pins);
+    if (err != ESP_OK) {
+        EPD_TEST_LOG("ERROR stage=bus err=%s", esp_err_to_name(err));
+        return err;
+    }
 
     const int64_t t_init = esp_timer_get_time();
     err = epd_init();
@@ -356,6 +374,7 @@ static esp_err_t display_bringup(void)
     }
     ESP_LOGI(TAG, "epd_init() took %lld ms", init_ms);
     EPD_TEST_LOG("init ok");
+    EPD_TEST_LOG("datapath=%s", epd_datapath_name());
 
     compose_black(&probe);
     compose_red();

@@ -3,7 +3,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_attr.h"
 #include "esp_check.h"
@@ -11,54 +10,51 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 
+#include "epd_bitbang.h"
 #include "epd_bus.h"
 
 static const char *TAG = "epd";
 
 #define EPD_SPI_HOST      SPI2_HOST
 #define EPD_MAX_TRANSFER  4096
-#define EPD_READ_MAX      8       /* REV (0x70) is the longest read: 7 bytes */
 #define EPD_DC_COMMAND    0
 #define EPD_DC_DATA       1
 #define EPD_BUSY_POLL_MS  5
 
-/* Reset pulse timing, transcribed from the tri-colour Raspberry Pi reference
- * driver EPD_7in5b_V2.c:40-48 (EPD_Reset): DEV_Delay_ms(200) / 5 / 200.
- * The Waveshare references disagree with each other -- the black/white driver
- * EPD_7in5_V2.c:38-46 uses 20 ms / 2 ms / 20 ms and the tri-colour ESP32 port
- * EPD_7in5b_V2.cpp:37-45 uses 200 ms / 2 ms / 200 ms -- and the spec gives no
- * minimum RST_N pulse width. The panel actually fitted here is the tri-colour
- * one, so wave 2 follows its own reference: the longest, most conservative
- * timing. The cost is 400 ms per reset, paid twice per boot (probe + init),
- * which is negligible next to a 15-25 s refresh. */
-#define EPD_RST_HIGH_MS   200
-#define EPD_RST_LOW_MS    5
+#if CONFIG_EPD_DATA_BITBANG
+#define EPD_DATAPATH_BITBANG 1
+#else
+#define EPD_DATAPATH_BITBANG 0
+#endif
 
 typedef struct {
+#if !EPD_DATAPATH_BITBANG
     spi_device_handle_t dev;
-    int  rst;
-    int  dc;
-    int  busy;
+#endif
     bool inited;
 } epd_bus_ctx_t;
 
 static epd_bus_ctx_t s_bus;
 
-/* Staging buffer for fills and inversions, and receive buffer for register
- * reads. Both live in .bss (internal RAM) and are word aligned so the SPI
- * driver can hand them straight to DMA. The receive buffer is deliberately
- * larger than EPD_READ_MAX-rounded-up: DMA writes whole words, so the buffer
- * must be a multiple of 4 bytes. */
+#if !EPD_DATAPATH_BITBANG
+/* Staging buffer for fills and inversions. It lives in .bss (internal RAM) and
+ * is word aligned so the SPI driver can hand it straight to DMA. */
 static WORD_ALIGNED_ATTR uint8_t s_chunk[EPD_CHUNK_BYTES];
-static WORD_ALIGNED_ATTR uint8_t s_rx[16];
 
 /* Called by the SPI driver just before a transaction starts, i.e. before CS
  * is asserted, so the DC line is already stable when the panel latches the
- * first bit. trans->user carries 0 for a command and 1 for data. */
-static IRAM_ATTR void epd_bus_pre_cb(spi_transaction_t *trans)
+ * first bit. trans->user carries 0 for a command and 1 for data. Every
+ * transfer here goes through spi_device_polling_transmit(), so this always
+ * runs in task context and may call ordinary flash-resident code. */
+static void epd_bus_pre_cb(spi_transaction_t *trans)
 {
-    int dc = (int)(intptr_t)trans->user;
-    gpio_set_level(s_bus.dc, dc);
+    epd_bb_set_dc((int)(intptr_t)trans->user);
+}
+#endif
+
+const char *epd_datapath_name(void)
+{
+    return EPD_DATAPATH_BITBANG ? "bitbang" : "spi";
 }
 
 void epd_bus_delay_ms(uint32_t ms)
@@ -86,33 +82,22 @@ esp_err_t epd_bus_init(const epd_pins_t *pins)
     ESP_RETURN_ON_FALSE(pins != NULL, ESP_ERR_INVALID_ARG, TAG, "pins is NULL");
     ESP_RETURN_ON_FALSE(!s_bus.inited, ESP_ERR_INVALID_STATE, TAG, "bus already initialised");
 
+#if EPD_DATAPATH_BITBANG
+    /* Diagnostic data path: no SPI peripheral at all, every byte is clocked
+     * out by epd_bitbang.c. epd_probe() has already released the pins. */
+    ESP_RETURN_ON_ERROR(epd_bb_init(pins), TAG, "bit-bang init failed");
+    s_bus.inited = true;
+    ESP_LOGI(TAG, "bus ready (bit-bang): sck=%d mosi=%d cs=%d dc=%d rst=%d busy=%d",
+             pins->sck, pins->mosi, pins->cs, pins->dc, pins->rst, pins->busy);
+    return ESP_OK;
+#else
     int hz = pins->spi_hz > 0 ? pins->spi_hz : CONFIG_EPD_SPI_HZ;
 
-    /* RST and DC are plain outputs; CS is driven by the SPI peripheral.
-     * RST idles high (the reset is active low, spec note 1.5-3). */
-    gpio_config_t out_cfg = {
-        .pin_bit_mask = (1ULL << pins->rst) | (1ULL << pins->dc),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&out_cfg), TAG, "gpio_config(rst/dc) failed");
-    ESP_RETURN_ON_ERROR(gpio_set_level(pins->rst, 1), TAG, "rst high failed");
-    ESP_RETURN_ON_ERROR(gpio_set_level(pins->dc, 0), TAG, "dc low failed");
-
-    /* BUSY_N is an input with the internal pull-down enabled: with no panel
-     * attached the pin then reads 0 deterministically instead of floating.
-     * The controller's push-pull output easily overrides the ~45 kOhm
-     * pull-down when a panel is present. */
-    gpio_config_t busy_cfg = {
-        .pin_bit_mask = (1ULL << pins->busy),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&busy_cfg), TAG, "gpio_config(busy) failed");
+    /* RST, DC and BUSY belong to epd_bitbang.c whichever data path is in use,
+     * so the reset pulse and the BUSY sampling exist in exactly one place.
+     * CS/SCK/MOSI are claimed by the SPI peripheral below; the probe already
+     * released them with epd_bb_release(). */
+    ESP_RETURN_ON_ERROR(epd_bb_init_ctrl(pins), TAG, "control pins failed");
 
     spi_bus_config_t bus_cfg = {
         .sclk_io_num     = pins->sck,
@@ -125,25 +110,23 @@ esp_err_t epd_bus_init(const epd_pins_t *pins)
     ESP_RETURN_ON_ERROR(spi_bus_initialize(EPD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO),
                         TAG, "spi_bus_initialize failed");
 
-    /* SPI_DEVICE_3WIRE makes the peripheral use the MOSI pin (spid) for both
-     * directions, SPI_DEVICE_HALFDUPLEX splits a transaction into a send
-     * phase and a receive phase instead of running them at once. input_delay_ns
-     * covers the GPIO-matrix round trip; at 4 MHz it still resolves to zero
-     * compensation dummy bits, which is what the UC8179 expects (it starts
-     * driving SDA immediately after the command byte). */
+    /* Plain full-duplex, write-only: flags = 0, no MISO pin. This is what
+     * every working e-paper driver does (GxEPD2, the IDF spi_master LCD
+     * example) and it is what wave 2 got wrong: with
+     * SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_3WIRE the short command transactions
+     * still reached the panel, but the 4000-byte DMA image transfers silently
+     * did not, leaving the controller's RAM uninitialised (random noise on the
+     * glass). Reads no longer share this device -- they are bit-banged in
+     * epd_bitbang.c before the bus exists -- so nothing here has to care about
+     * the bidirectional SDA line any more. */
     spi_device_interface_config_t dev_cfg = {
         .mode           = 0,
         .clock_speed_hz = hz,
         .spics_io_num   = pins->cs,
         .queue_size     = 4,
-        .flags          = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_3WIRE,
-        .input_delay_ns = 50,
+        .flags          = 0,
         .pre_cb         = epd_bus_pre_cb,
     };
-
-    s_bus.rst  = pins->rst;
-    s_bus.dc   = pins->dc;
-    s_bus.busy = pins->busy;
 
     esp_err_t err = spi_bus_add_device(EPD_SPI_HOST, &dev_cfg, &s_bus.dev);
     if (err != ESP_OK) {
@@ -153,11 +136,13 @@ esp_err_t epd_bus_init(const epd_pins_t *pins)
     }
 
     s_bus.inited = true;
-    ESP_LOGI(TAG, "bus ready: sck=%d mosi=%d cs=%d dc=%d rst=%d busy=%d %d Hz",
+    ESP_LOGI(TAG, "bus ready (spi): sck=%d mosi=%d cs=%d dc=%d rst=%d busy=%d %d Hz",
              pins->sck, pins->mosi, pins->cs, pins->dc, pins->rst, pins->busy, hz);
     return ESP_OK;
+#endif
 }
 
+#if !EPD_DATAPATH_BITBANG
 /* One transfer of up to EPD_CHUNK_BYTES data bytes with DC high. */
 static esp_err_t epd_bus_write_chunk(const uint8_t *p, size_t n)
 {
@@ -168,11 +153,16 @@ static esp_err_t epd_bus_write_chunk(const uint8_t *p, size_t n)
     };
     return spi_device_polling_transmit(s_bus.dev, &t);
 }
+#endif
 
 esp_err_t epd_bus_cmd(uint8_t cmd)
 {
     ESP_RETURN_ON_FALSE(s_bus.inited, ESP_ERR_INVALID_STATE, TAG, "bus not initialised");
 
+#if EPD_DATAPATH_BITBANG
+    epd_bb_cmd(cmd);
+    return ESP_OK;
+#else
     spi_transaction_t t = {
         .flags  = SPI_TRANS_USE_TXDATA,
         .length = 8,
@@ -180,6 +170,7 @@ esp_err_t epd_bus_cmd(uint8_t cmd)
     };
     t.tx_data[0] = cmd;
     return spi_device_polling_transmit(s_bus.dev, &t);
+#endif
 }
 
 esp_err_t epd_bus_data(const uint8_t *p, size_t n)
@@ -191,6 +182,24 @@ esp_err_t epd_bus_data(const uint8_t *p, size_t n)
         return ESP_OK;
     }
 
+#if EPD_DATAPATH_BITBANG
+    /* A whole plane takes about a second of busy-looping, so the chunk loop
+     * hands the CPU back between chunks: the idle task must still run or the
+     * task watchdog fires. CS is deasserted after every byte anyway (that is
+     * how the Waveshare reference clocks bytes out), so a pause between two
+     * bytes is invisible to the controller. */
+    size_t off = 0;
+    while (off < n) {
+        size_t len = n - off;
+        if (len > EPD_CHUNK_BYTES) {
+            len = EPD_CHUNK_BYTES;
+        }
+        epd_bb_data(p + off, len);
+        off += len;
+        vTaskDelay(1);
+    }
+    return ESP_OK;
+#else
     /* Up to four bytes fit in the transaction descriptor itself, which avoids
      * any DMA-capability question for the small init payloads. */
     if (n <= 4) {
@@ -216,12 +225,24 @@ esp_err_t epd_bus_data(const uint8_t *p, size_t n)
         off += len;
     }
     return ESP_OK;
+#endif
 }
 
 esp_err_t epd_bus_data_fill(uint8_t value, size_t n)
 {
     ESP_RETURN_ON_FALSE(s_bus.inited, ESP_ERR_INVALID_STATE, TAG, "bus not initialised");
 
+#if EPD_DATAPATH_BITBANG
+    epd_bb_set_dc(1);
+    for (size_t i = 0; i < n; i++) {
+        epd_bb_write_byte(value);
+        if ((i % EPD_CHUNK_BYTES) == (EPD_CHUNK_BYTES - 1)) {
+            vTaskDelay(1);
+            epd_bb_set_dc(1);
+        }
+    }
+    return ESP_OK;
+#else
     size_t off = 0;
     size_t filled = 0;
     while (off < n) {
@@ -237,6 +258,7 @@ esp_err_t epd_bus_data_fill(uint8_t value, size_t n)
         off += len;
     }
     return ESP_OK;
+#endif
 }
 
 esp_err_t epd_bus_data_inv(const uint8_t *src, size_t n)
@@ -244,6 +266,17 @@ esp_err_t epd_bus_data_inv(const uint8_t *src, size_t n)
     ESP_RETURN_ON_FALSE(s_bus.inited, ESP_ERR_INVALID_STATE, TAG, "bus not initialised");
     ESP_RETURN_ON_FALSE(src != NULL || n == 0, ESP_ERR_INVALID_ARG, TAG, "src is NULL");
 
+#if EPD_DATAPATH_BITBANG
+    epd_bb_set_dc(1);
+    for (size_t i = 0; i < n; i++) {
+        epd_bb_write_byte((uint8_t)~src[i]);
+        if ((i % EPD_CHUNK_BYTES) == (EPD_CHUNK_BYTES - 1)) {
+            vTaskDelay(1);
+            epd_bb_set_dc(1);
+        }
+    }
+    return ESP_OK;
+#else
     size_t off = 0;
     while (off < n) {
         size_t len = n - off;
@@ -257,79 +290,25 @@ esp_err_t epd_bus_data_inv(const uint8_t *src, size_t n)
         off += len;
     }
     return ESP_OK;
-}
-
-esp_err_t epd_bus_read(uint8_t cmd, uint8_t *out, size_t n)
-{
-    ESP_RETURN_ON_FALSE(s_bus.inited, ESP_ERR_INVALID_STATE, TAG, "bus not initialised");
-    ESP_RETURN_ON_FALSE(out != NULL && n > 0 && n <= EPD_READ_MAX, ESP_ERR_INVALID_ARG,
-                        TAG, "bad read length %u", (unsigned)n);
-
-    /* SPI_TRANS_CS_KEEP_ACTIVE is only accepted while the bus is acquired
-     * (spi_master.c rejects it otherwise), and IDF 5.0 refuses a single
-     * half-duplex transaction that has both a send and a receive phase, so
-     * the read is two transactions under one bus lock. */
-    ESP_RETURN_ON_ERROR(spi_device_acquire_bus(s_bus.dev, portMAX_DELAY),
-                        TAG, "acquire_bus failed");
-
-    spi_transaction_t tcmd = {
-        .flags  = SPI_TRANS_USE_TXDATA | SPI_TRANS_CS_KEEP_ACTIVE,
-        .length = 8,
-        .user   = (void *)(intptr_t)EPD_DC_COMMAND,
-    };
-    tcmd.tx_data[0] = cmd;
-
-    esp_err_t err = spi_device_polling_transmit(s_bus.dev, &tcmd);
-    if (err == ESP_OK) {
-        memset(s_rx, 0, sizeof(s_rx));
-        /* Receive-only: no tx_buffer and no USE_TXDATA, so the send phase is
-         * skipped and the peripheral releases the shared SDA line while the
-         * controller drives it. rxlength must be non-zero for the receive
-         * phase to run at all in half-duplex mode. */
-        spi_transaction_t tdat = {
-            .length    = 8 * n,
-            .rxlength  = 8 * n,
-            .tx_buffer = NULL,
-            .rx_buffer = s_rx,
-            .user      = (void *)(intptr_t)EPD_DC_DATA,
-        };
-        err = spi_device_polling_transmit(s_bus.dev, &tdat);
-        if (err == ESP_OK) {
-            memcpy(out, s_rx, n);
-        }
-    }
-
-    spi_device_release_bus(s_bus.dev);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "read 0x%02X failed: %s", cmd, esp_err_to_name(err));
-    }
-    return err;
+#endif
 }
 
 void epd_bus_reset_pulse(void)
 {
-    if (!s_bus.inited) {
-        return;
-    }
-    gpio_set_level(s_bus.rst, 1);
-    epd_bus_delay_ms(EPD_RST_HIGH_MS);
-    gpio_set_level(s_bus.rst, 0);
-    epd_bus_delay_ms(EPD_RST_LOW_MS);
-    gpio_set_level(s_bus.rst, 1);
-    epd_bus_delay_ms(EPD_RST_HIGH_MS);
+    epd_bb_reset_pulse();
 }
 
 int epd_bus_busy_level(void)
 {
-    if (!s_bus.inited) {
-        return -1;
-    }
-    return gpio_get_level(s_bus.busy);
+    return epd_bb_busy_level();
 }
 
 esp_err_t epd_bus_wait_busy_high(int timeout_ms, int *elapsed_ms)
 {
-    ESP_RETURN_ON_FALSE(s_bus.inited, ESP_ERR_INVALID_STATE, TAG, "bus not initialised");
+    /* Only the control pins have to be configured: this is also used by the
+     * probe, which runs before epd_bus_init(). */
+    ESP_RETURN_ON_FALSE(epd_bb_ctrl_ready(), ESP_ERR_INVALID_STATE, TAG,
+                        "control pins not configured");
 
     /* BUSY_N low means the controller is working and must not be interrupted
      * (spec note 1.5-4). No status command is sent while waiting; only the
@@ -340,7 +319,7 @@ esp_err_t epd_bus_wait_busy_high(int timeout_ms, int *elapsed_ms)
     esp_err_t err = ESP_ERR_TIMEOUT;
 
     for (;;) {
-        if (gpio_get_level(s_bus.busy) == 1) {
+        if (epd_bb_busy_level() == 1) {
             err = ESP_OK;
             break;
         }

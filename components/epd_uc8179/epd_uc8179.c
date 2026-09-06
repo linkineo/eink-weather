@@ -20,6 +20,7 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 
+#include "epd_bitbang.h"
 #include "epd_bus.h"
 #include "epd_uc8179.h"
 
@@ -77,6 +78,29 @@ static esp_err_t epd_cmd_data(uint8_t cmd, const uint8_t *data, size_t n)
 static esp_err_t epd_cmd_byte(uint8_t cmd, uint8_t value)
 {
     return epd_cmd_data(cmd, &value, 1);
+}
+
+/* Same, over the bit-bang transport used by the probe (no error path: the
+ * GPIO writes cannot fail once the pins are configured). */
+static void epd_bb_cmd_data(uint8_t cmd, const uint8_t *data, size_t n)
+{
+    epd_bb_cmd(cmd);
+    if (n > 0) {
+        epd_bb_data(data, n);
+    }
+}
+
+/* Send one full plane and log how long the transfer itself took, which is the
+ * number that separates a working data path from a silently discarded one
+ * (and tells the two Kconfig data paths apart: ~0.1 s over SPI at 4 MHz,
+ * ~1 s bit-banged). */
+static esp_err_t epd_log_plane(int plane, esp_err_t err, int64_t t0)
+{
+    const int ms = (int)((esp_timer_get_time() - t0) / 1000);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "plane %d: %d bytes in %d ms", plane, (int)EPD_PLANE_BYTES, ms);
+    }
+    return err;
 }
 
 /* PWR 0x01: VGH=20V, VGL=-20V, VDH=15V, VDL=-15V.
@@ -168,10 +192,15 @@ esp_err_t epd_clear(void)
 
     /* EPD_7in5b_V2.c:204-222 (Clear): DTM1 all 0xFF, DTM2 all 0x00.
      * EPD_7in5_V2.c:252-279 uses the same two values. */
+    int64_t t0 = esp_timer_get_time();
     ESP_RETURN_ON_ERROR(epd_bus_cmd(UC8179_DTM1), TAG, "DTM1 failed");
-    ESP_RETURN_ON_ERROR(epd_bus_data_fill(0xFF, EPD_PLANE_BYTES), TAG, "DTM1 fill failed");
+    ESP_RETURN_ON_ERROR(epd_log_plane(1, epd_bus_data_fill(0xFF, EPD_PLANE_BYTES), t0),
+                        TAG, "DTM1 fill failed");
+
+    t0 = esp_timer_get_time();
     ESP_RETURN_ON_ERROR(epd_bus_cmd(UC8179_DTM2), TAG, "DTM2 failed");
-    ESP_RETURN_ON_ERROR(epd_bus_data_fill(0x00, EPD_PLANE_BYTES), TAG, "DTM2 fill failed");
+    ESP_RETURN_ON_ERROR(epd_log_plane(2, epd_bus_data_fill(0x00, EPD_PLANE_BYTES), t0),
+                        TAG, "DTM2 fill failed");
 
     return epd_turn_on_display();
 }
@@ -182,8 +211,12 @@ esp_err_t epd_display(const uint8_t *black, const uint8_t *red)
     ESP_RETURN_ON_FALSE(black != NULL, ESP_ERR_INVALID_ARG, TAG, "black plane is NULL");
 
     /* DTM1 always carries the black plane verbatim: bit 1 = white, 0 = black. */
+    int64_t t0 = esp_timer_get_time();
     ESP_RETURN_ON_ERROR(epd_bus_cmd(UC8179_DTM1), TAG, "DTM1 failed");
-    ESP_RETURN_ON_ERROR(epd_bus_data(black, EPD_PLANE_BYTES), TAG, "DTM1 data failed");
+    ESP_RETURN_ON_ERROR(epd_log_plane(1, epd_bus_data(black, EPD_PLANE_BYTES), t0),
+                        TAG, "DTM1 data failed");
+
+    t0 = esp_timer_get_time();
     ESP_RETURN_ON_ERROR(epd_bus_cmd(UC8179_DTM2), TAG, "DTM2 failed");
 
 #if EPD_PANEL_IS_BW
@@ -191,15 +224,18 @@ esp_err_t epd_display(const uint8_t *black, const uint8_t *red)
      * the image in DTM2. The reference inverts the caller's buffer in place;
      * here the inversion is staged in the driver's chunk buffer instead. */
     (void)red;
-    ESP_RETURN_ON_ERROR(epd_bus_data_inv(black, EPD_PLANE_BYTES), TAG, "DTM2 data failed");
+    ESP_RETURN_ON_ERROR(epd_log_plane(2, epd_bus_data_inv(black, EPD_PLANE_BYTES), t0),
+                        TAG, "DTM2 data failed");
 #else
     /* EPD_7in5b_V2.c:283-288: the tri-colour panel wants the red plane
      * inverted (~ryimage[i]). The application's red buffer uses 0xFF for
      * "no red", so an absent buffer is equivalent to sending 0x00. */
     if (red != NULL) {
-        ESP_RETURN_ON_ERROR(epd_bus_data_inv(red, EPD_PLANE_BYTES), TAG, "DTM2 data failed");
+        ESP_RETURN_ON_ERROR(epd_log_plane(2, epd_bus_data_inv(red, EPD_PLANE_BYTES), t0),
+                            TAG, "DTM2 data failed");
     } else {
-        ESP_RETURN_ON_ERROR(epd_bus_data_fill(0x00, EPD_PLANE_BYTES), TAG, "DTM2 fill failed");
+        ESP_RETURN_ON_ERROR(epd_log_plane(2, epd_bus_data_fill(0x00, EPD_PLANE_BYTES), t0),
+                            TAG, "DTM2 fill failed");
     }
 #endif
 
@@ -250,10 +286,44 @@ static void epd_probe_set_verdict(epd_probe_result_t *r, const char *verdict)
     r->present = (strcmp(verdict, "PRESENT") == 0);
 }
 
-esp_err_t epd_probe(epd_probe_result_t *out)
+/* A read that came back from an undriven SDA line rather than from the
+ * controller: every byte 0xFF, or the 0x7F-then-0xFF pattern wave 2 saw (the
+ * accumulator starts at 0xFF and its top bit is shifted out before the first
+ * sample, so a line that idles high yields 0x7F for the first byte and 0xFF
+ * for the rest). */
+static bool epd_read_is_float_high(const uint8_t *p, size_t n)
 {
+    if (n == 0 || (p[0] != 0xFF && p[0] != 0x7F)) {
+        return false;
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (p[i] != 0xFF) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A read that came back as a line held low. */
+static bool epd_read_is_zero(const uint8_t *p, size_t n)
+{
+    if (n == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] != 0x00) {
+            return false;
+        }
+    }
+    return true;
+}
+
+esp_err_t epd_probe(const epd_pins_t *pins, epd_probe_result_t *out)
+{
+    ESP_RETURN_ON_FALSE(pins != NULL, ESP_ERR_INVALID_ARG, TAG, "pins is NULL");
     ESP_RETURN_ON_FALSE(out != NULL, ESP_ERR_INVALID_ARG, TAG, "out is NULL");
-    ESP_RETURN_ON_FALSE(epd_bus_ready(), ESP_ERR_INVALID_STATE, TAG, "call epd_bus_init() first");
+    ESP_RETURN_ON_FALSE(!epd_bus_ready(), ESP_ERR_INVALID_STATE, TAG,
+                        "epd_probe() must run before epd_bus_init()");
 
     memset(out, 0, sizeof(*out));
     out->busy_low_ms     = -1;
@@ -261,33 +331,31 @@ esp_err_t epd_probe(epd_probe_result_t *out)
     out->pbc_pass        = -1;
     epd_probe_set_verdict(out, "UNCERTAIN");
 
+    /* The whole probe runs on bit-banged GPIO. The SPI peripheral cannot read
+     * this 3-wire bus (wave 2: every register came back as a floating line),
+     * while Waveshare's own ESP32 port drives the pins by hand and does read
+     * it, so the probe follows that path and hands the pins over afterwards. */
+    ESP_RETURN_ON_ERROR(epd_bb_init(pins), TAG, "bit-bang init failed");
+
     /* 1. Reset, then look at BUSY. A healthy controller idles high. */
-    epd_bus_reset_pulse();
-    out->busy_after_reset = epd_bus_busy_level();
+    epd_bb_reset_pulse();
+    out->busy_after_reset = epd_bb_busy_level();
 
     /* 2. Bring the analogue rails up and watch BUSY. On a present panel PON
      *    pulls BUSY_N low while the booster and regulators start and the
      *    internal temperature sensor takes its one-time reading, then
      *    releases it (spec, Power ON section: "When all voltages are ready,
-     *    the BUSY_N signal will return to high"). A missing panel cannot
-     *    produce that low-then-high edge on command, which makes it the
-     *    primary presence signature. */
-    esp_err_t err = epd_cmd_data(UC8179_PWR, k_pwr, sizeof(k_pwr));
-    if (err == ESP_OK) {
-        err = epd_cmd_data(UC8179_BTST, k_btst, sizeof(k_btst));
-    }
-    if (err == ESP_OK) {
-        err = epd_bus_cmd(UC8179_PON);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: power-on commands failed: %s", esp_err_to_name(err));
-        return err;
-    }
+     *    the BUSY_N signal will return to high"). A pin held down by the
+     *    internal pull-down cannot produce that low-then-high edge on
+     *    command, which makes it the primary presence signature. */
+    epd_bb_cmd_data(UC8179_PWR, k_pwr, sizeof(k_pwr));
+    epd_bb_cmd_data(UC8179_BTST, k_btst, sizeof(k_btst));
+    epd_bb_cmd(UC8179_PON);
 
     const int64_t t0 = esp_timer_get_time();
     bool seen_low = false;
     for (unsigned i = 0;; i++) {
-        int level = epd_bus_busy_level();
+        int level = epd_bb_busy_level();
         int ms = (int)((esp_timer_get_time() - t0) / 1000);
 
         if (!seen_low) {
@@ -311,69 +379,59 @@ esp_err_t epd_probe(epd_probe_result_t *out)
      *    separate sensing time for TSC (0x40) with the internal sensor: PON
      *    already performed the one-time sensing, so a short settle is enough. */
     epd_bus_delay_ms(EPD_PROBE_READ_SETTLE_MS);
-    if (epd_bus_busy_level() != 1) {
+    if (epd_bb_busy_level() != 1) {
         ESP_LOGW(TAG, "probe: BUSY still low, register reads may be unreliable");
     }
 
-    uint8_t raw[11];
-    size_t  raw_len = 0;
-    bool    any_read = false;
-
     /* REV (0x70): PROD_REV[23:0], LUT_REV[23:0], CHIP_REV. CHIP_REV is fixed
-     * at 00001100b = 0x0C (spec, Revision section). */
-    if (epd_bus_read(UC8179_REV, out->rev, sizeof(out->rev)) == ESP_OK) {
-        memcpy(raw + raw_len, out->rev, sizeof(out->rev));
-        raw_len += sizeof(out->rev);
-        any_read = true;
-    }
+     * at 00001100b = 0x0C (spec, Revision section), which is what makes it
+     * the reads_ok witness. */
+    epd_bb_read(UC8179_REV, out->rev, sizeof(out->rev));
 
     /* FLG (0x71): b6 PTL_FLAG, b5 I2C_ERR, b4 I2C_BUSYN, b3 DATA_FLAG,
      * b2 PON, b1 POF, b0 BUSY_N (spec, Get Status section; reset value
      * 0x13). PON should read 1 and BUSY_N 1 while idle and powered. */
     uint8_t flg = 0;
-    if (epd_bus_read(UC8179_FLG, &flg, 1) == ESP_OK) {
-        out->flg = flg;
-        raw[raw_len++] = flg;
-        any_read = true;
-    }
+    epd_bb_read(UC8179_FLG, &flg, 1);
+    out->flg = flg;
 
     /* TSC (0x40): byte 0 is TS[7:0], the internal sensor reading in degrees
      * Celsius, two's complement (spec table: 1110_0111 = -25, 0000_0000 = 0,
      * 0001_1001 = +25). Byte 1 only carries D[2:0] for an external sensor. */
     uint8_t tsc[2] = { 0, 0 };
-    if (epd_bus_read(UC8179_TSC, tsc, sizeof(tsc)) == ESP_OK) {
-        out->temp_c = (int8_t)tsc[0];
-        raw[raw_len++] = tsc[0];
-        raw[raw_len++] = tsc[1];
-        any_read = true;
-    }
+    epd_bb_read(UC8179_TSC, tsc, sizeof(tsc));
+    out->temp_c = (int8_t)tsc[0];
 
     /* PBC (0x44): bit 0 is PSTA, 1 = panel glass check pass. */
     uint8_t pbc = 0;
-    if (epd_bus_read(UC8179_PBC, &pbc, 1) == ESP_OK) {
-        out->pbc_pass = pbc & 0x01;
-        raw[raw_len++] = pbc;
-        any_read = true;
-    }
+    epd_bb_read(UC8179_PBC, &pbc, 1);
+    out->pbc_pass = pbc & 0x01;
 
-    /* 4. Verdict. */
-    bool sig_complete = (out->busy_low_ms >= 0 && out->busy_release_ms >= 0);
-    bool all_zero = any_read;
-    bool all_ff   = any_read;
-    for (size_t i = 0; i < raw_len; i++) {
-        if (raw[i] != 0x00) {
-            all_zero = false;
-        }
-        if (raw[i] != 0xFF) {
-            all_ff = false;
-        }
-    }
+    out->reads_ok = (out->rev[6] == 0x0C);
+    ESP_LOGI(TAG, "probe: reads=%s rev=%02x %02x %02x %02x %02x %02x %02x "
+                  "flg=0x%02X tsc=%02x %02x pbc=0x%02X",
+             out->reads_ok ? "ok" : "bad",
+             out->rev[0], out->rev[1], out->rev[2], out->rev[3],
+             out->rev[4], out->rev[5], out->rev[6],
+             flg, tsc[0], tsc[1], pbc);
 
-    if (out->rev[6] == 0x0C) {
+    /* 4. Verdict. Two independent witnesses: a CHIP_REV of 0x0C means the
+     *    read path really carried controller data, and a complete BUSY
+     *    low-then-high signature means something answered a command on a pin
+     *    the ESP32 pulls down. Either one on its own is conclusive. */
+    const bool sig_complete = (out->busy_low_ms >= 0 && out->busy_release_ms >= 0);
+    const bool all_float = epd_read_is_float_high(out->rev, sizeof(out->rev))
+                           && epd_read_is_float_high(&flg, 1)
+                           && epd_read_is_float_high(tsc, sizeof(tsc))
+                           && epd_read_is_float_high(&pbc, 1);
+    const bool all_zero = epd_read_is_zero(out->rev, sizeof(out->rev))
+                          && epd_read_is_zero(&flg, 1)
+                          && epd_read_is_zero(tsc, sizeof(tsc))
+                          && epd_read_is_zero(&pbc, 1);
+
+    if (out->reads_ok || sig_complete) {
         epd_probe_set_verdict(out, "PRESENT");
-    } else if (sig_complete && out->flg != 0x00 && out->flg != 0xFF) {
-        epd_probe_set_verdict(out, "PRESENT");
-    } else if ((all_zero || all_ff) && !sig_complete) {
+    } else if (all_zero || all_float) {
         epd_probe_set_verdict(out, "ABSENT");
     } else {
         epd_probe_set_verdict(out, "UNCERTAIN");
@@ -381,19 +439,17 @@ esp_err_t epd_probe(epd_probe_result_t *out)
 
     /* 5. Power the panel back down so epd_init() starts from a known state.
      *    A short timeout: the probe must never hang. */
-    esp_err_t pof_err = epd_bus_cmd(UC8179_POF);
-    if (pof_err == ESP_OK) {
-        int ms = 0;
-        pof_err = epd_bus_wait_busy_high(EPD_PROBE_POF_TIMEOUT_MS, &ms);
-        if (pof_err == ESP_OK) {
-            ESP_LOGI(TAG, "probe: power-off: BUSY released after %d ms", ms);
-        } else {
-            ESP_LOGW(TAG, "probe: power-off wait gave up after %d ms", ms);
-        }
+    epd_bb_cmd(UC8179_POF);
+    int ms = 0;
+    if (epd_bus_wait_busy_high(EPD_PROBE_POF_TIMEOUT_MS, &ms) == ESP_OK) {
+        ESP_LOGI(TAG, "probe: power-off: BUSY released after %d ms", ms);
     } else {
-        ESP_LOGW(TAG, "probe: POF failed: %s", esp_err_to_name(pof_err));
+        ESP_LOGW(TAG, "probe: power-off wait gave up after %d ms", ms);
     }
 
+    /* 6. Hand SCK/MOSI/CS back so epd_bus_init() can claim them. RST, DC and
+     *    BUSY stay configured -- epd_bitbang.c owns them for both transports. */
+    epd_bb_release();
     return ESP_OK;
 }
 
@@ -406,10 +462,12 @@ void epd_probe_format(const epd_probe_result_t *r, char *buf, size_t len)
         buf[0] = '\0';
         return;
     }
+    /* reads=bad marks chip_rev/prod/lut/flg/temp/pbc as garbage from an
+     * undriven line: the BUSY fields are still trustworthy. */
     snprintf(buf, len,
-             "probe verdict=%s chip_rev=0x%02X prod=%02x.%02x.%02x lut=%02x.%02x.%02x "
+             "probe verdict=%s reads=%s chip_rev=0x%02X prod=%02x.%02x.%02x lut=%02x.%02x.%02x "
              "flg=0x%02X temp=%dC pbc=%d busy_after_reset=%d busy_low_ms=%d busy_release_ms=%d",
-             r->verdict, r->rev[6],
+             r->verdict, r->reads_ok ? "ok" : "bad", r->rev[6],
              r->rev[0], r->rev[1], r->rev[2],
              r->rev[3], r->rev[4], r->rev[5],
              r->flg, (int)r->temp_c, r->pbc_pass,
