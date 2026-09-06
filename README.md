@@ -27,12 +27,17 @@ identify the chip and drive the panel.
 SPI clock at bring-up is 4 MHz. There is no software-controlled panel power pin
 on this board. See `main/board.h`.
 
-**Register reads are not possible on this panel.** The 7.5inch e-Paper V2
-specification says it twice, once for each serial mode: "Under serial mode,
-only write operations are allowed." The controller never drives SDA back, so
-`epd_probe()` reports `reads=bad` and its verdict rests on the BUSY line
-instead (see the log contract below). The probe still attempts the reads —
-they cost 11 bytes and they are the evidence for that statement.
+**The controller cannot be read back, and the firmware no longer tries.**
+The 7.5inch e-Paper V2 specification says it twice, once for each serial mode:
+"Under serial mode, only write operations are allowed." Two hardware runs
+confirmed it — through the SPI peripheral in half-duplex 3-wire mode and
+through hand-clocked GPIO — and both times a read returned the last bit the
+ESP32 had driven on the shared SDA line, never controller data. So there is no
+chip revision, no status flag word, no panel temperature and no glass-check
+result to display anywhere: `epd_probe()` detects the panel from the **BUSY
+power-on signature** alone (BUSY_N goes low while PON brings the rails up, then
+returns high), and that is the only thing this controller ever tells us about
+itself.
 
 ## Quick start
 
@@ -67,19 +72,65 @@ idf.py build
 
 and check the resulting `[EPD-TEST] datapath=` line in the capture.
 
+### Diagnostic mode: does the controller see D/C?
+
+`CONFIG_APP_DIAG_ONLY=y` replaces the whole display path with
+`epd_dc_diag()` (`components/epd_uc8179/epd_diag.c`). It answers one
+electrical question — does the controller see the D/C (data/command) line? —
+and **never refreshes the panel**, so unlike the display build it can be run
+as often as needed.
+
+The question is worth asking because commands demonstrably work here (PON
+pulls BUSY low and releases it, DRF runs a real 17.8 s tri-colour refresh)
+while data bytes apparently never do: both planes are clocked out in full and
+the glass still comes up as random noise, i.e. the controller's RAM was never
+written. A D/C line stuck low at the controller — an open contact on the FPC
+or FFC, a broken trace — produces exactly that: every byte becomes a command,
+so PON/DRF/POF still work and image bytes are executed as invalid commands.
+
+With reads impossible, the only observable is the BUSY power-on signature, so
+the diagnostic sends the byte `0x04` (PON) under four different D/C conditions
+and watches BUSY for 400 ms each time:
+
+| Oracle | What it sends | `pon=yes` means |
+| ------ | ------------- | --------------- |
+| D (control) | `0x04` with DC=0 | the detector works (expected) |
+| A | CDI `0x50`, then `0x04` with DC=1 | a data byte executed as a command |
+| B | DSLP `0x07` + `0xA5` with DC=1, then PON | the `0xA5` never armed deep sleep |
+| E (polarity) | a lone `0x04` with DC=1 | D/C ignored, or inverted |
+
+`verdict=DC_OK` (D yes, the rest no) means the line is fine and the noise has
+another cause; `DC_NOT_SEEN` (all four yes) points at the connector, not the
+firmware; `DC_INVERTED` (D no, E yes) means the sense is reversed. A pad check
+on GPIO 27/26/15/13/14 runs first, with the panel held in reset, and reports
+the read-back of each pin driven high and low (`1/0` = healthy).
+
+```sh
+sed -i '' 's|^# CONFIG_APP_DIAG_ONLY is not set$|CONFIG_APP_DIAG_ONLY=y|' sdkconfig
+idf.py build
+tools/flash.sh --capture --timeout 40 --expect "dctest"
+```
+
+Switch back with the reverse `sed` (`CONFIG_APP_DIAG_ONLY=y` →
+`# CONFIG_APP_DIAG_ONLY is not set`) — or `idf.py menuconfig`, menu
+"eink-weather bring-up".
+
 ## Repository layout
 
 ```
 CMakeLists.txt         project definition
 sdkconfig.defaults     target, flash and console settings
-main/                  application: app_main.c, board.h, test_log.h
+main/                  application: app_main.c, board.h, test_log.h,
+                       Kconfig.projbuild (APP_DIAG_ONLY)
 components/gfx/        1-bpp framebuffer and drawing primitives
                        (vendored Waveshare GUI_Paint + STM fonts, gfx_* helpers)
 components/epd_uc8179/ UC8179 panel driver: epd_bus.c (write path, plain
-                       full-duplex SPI), epd_bitbang.c (GPIO transport for the
-                       probe, and owner of RST/DC/BUSY), epd_uc8179.c (probe,
-                       init / display / sleep sequences). Kconfig: panel
-                       variant, BUSY timeout, SPI clock, EPD_DATA_BITBANG
+                       full-duplex SPI), epd_bitbang.c (write-only GPIO
+                       transport for the diagnostics, and owner of
+                       RST/DC/BUSY), epd_uc8179.c (probe, init / display /
+                       sleep sequences), epd_diag.c (D/C oracles, no refresh).
+                       Kconfig: panel variant, BUSY timeout, SPI clock,
+                       EPD_DATA_BITBANG
 tools/env.sh           sourced: activates the ESP-IDF toolchain
 tools/flash.sh         build + flash (+ optional capture)
 tools/capture.py       non-interactive UART capture for automated checks
@@ -87,7 +138,8 @@ tools/capture.py       non-interactive UART capture for automated checks
 
 The firmware performs **exactly one panel refresh per boot** and puts the panel
 back into deep sleep afterwards, on every exit path (Waveshare rule: a panel
-left powered is damaged by the sustained high voltage).
+left powered is damaged by the sustained high voltage). The `APP_DIAG_ONLY`
+build performs **none**, and leaves the panel powered off and reset.
 
 ## Log contract
 
@@ -95,17 +147,19 @@ The firmware prints machine-readable lines prefixed with `[EPD-TEST] `
 (see `main/test_log.h`). `tools/capture.py` parses them:
 
 - `[EPD-TEST] boot chip=... mac=... idf=... reset=... heap=...` — boot banner
-- `[EPD-TEST] probe verdict=PRESENT|ABSENT|UNCERTAIN reads=ok|bad
-  chip_rev=0x.. prod=.. lut=.. flg=0x.. temp=..C pbc=..
-  busy_after_reset=. busy_low_ms=.. busy_release_ms=..` — controller probe
-  (one line). `busy_low_ms` / `busy_release_ms` are the low-then-high BUSY
-  signature after power-on: both ≥ 0 means the controller answered a command
-  on a pin the ESP32 pulls down, which is the presence test that works here.
-  `reads=` says whether the register reads carried real data (`CHIP_REV`
-  == `0x0C`); on this panel it is always `bad`, and `chip_rev`, `prod`, `lut`,
-  `flg`, `temp` and `pbc` are then garbage from an undriven line — the panel
-  prints `n/a` for them rather than a plausible-looking number. The verdict is
-  informational only; the refresh is attempted whatever it says.
+- `[EPD-TEST] probe verdict=PRESENT|ABSENT|UNCERTAIN busy_after_reset=.
+  busy_low_ms=.. busy_release_ms=..` — controller probe (one line).
+  `busy_low_ms` / `busy_release_ms` are the low-then-high BUSY signature after
+  power-on, and they are the whole verdict: `PRESENT` when the signature
+  completed (something answered a command on a pin the ESP32 pulls down, which
+  nothing absent can fake), `ABSENT` when BUSY never went low, `UNCERTAIN` when
+  it went low and never came back. The verdict is informational; the refresh is
+  attempted whatever it says.
+- `[EPD-TEST] dctest pads=dc:1/0,rst:1/0,cs:1/0,sck:1/0,mosi:1/0
+  oracleD_pon=yes oracleA_pon=no oracleB_pon=no oracleE_pon=no
+  verdict=DC_OK|DC_NOT_SEEN|DC_INVERTED|INCONCLUSIVE` — the D/C diagnostic
+  (`CONFIG_APP_DIAG_ONLY`, one line, see above). This is the *only* panel line
+  that build prints: no `init`, no `refresh_ms`, no `sleep`
 - `[EPD-TEST] init ok` — panel initialisation sequence completed
 - `[EPD-TEST] datapath=spi|bitbang` — which transport carried the image
   (`CONFIG_EPD_DATA_BITBANG`)
@@ -113,8 +167,8 @@ The firmware prints machine-readable lines prefixed with `[EPD-TEST] `
   (≈ 15000–25000 ms on the tri-colour panel, ≈ 4000 ms would mean a b/w LUT)
 - `[EPD-TEST] sleep ok` — panel back in deep sleep
 - `[EPD-TEST] DONE` — success marker, capture stops here (exit 0)
-- `[EPD-TEST] ERROR stage=bus|init|display|sleep err=ESP_ERR_...` — failure
-  marker (exit 1); `stage=display err=ESP_ERR_TIMEOUT` means BUSY never
+- `[EPD-TEST] ERROR stage=bus|init|display|sleep|dcdiag err=ESP_ERR_...` —
+  failure marker (exit 1); `stage=display err=ESP_ERR_TIMEOUT` means BUSY never
   released
 - `[EPD-TEST] alive uptime=Ns heap=N` — heartbeat every 10 s
 

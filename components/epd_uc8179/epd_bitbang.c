@@ -1,14 +1,17 @@
 /*
  * Bit-banged GPIO transport for the UC8179, transcribed from the Waveshare
  * e-Paper ESP32 Driver Board demo (DEV_Config.cpp, V1.0 2020-02-19):
- * GPIO_Config(), GPIO_Mode(), DEV_SPI_WriteByte(), DEV_SPI_ReadByte().
+ * GPIO_Config() and DEV_SPI_WriteByte().
  *
  * The only deliberate difference is an explicit 1 us delay after each clock
  * edge. Arduino's digitalWrite() is slow enough that the reference needs no
  * delay; gpio_set_level() is not, so without one the clock would run far
  * above the controller's limits. 1 us per edge puts SCL at roughly 300-500
- * kHz, which is comfortably inside both the write cycle (tscycw >= 100 ns)
- * and the much stricter read cycle (tscycr >= 200 ns) of the UC8179.
+ * kHz, comfortably inside the UC8179's write cycle (tscycw >= 100 ns).
+ *
+ * Write only, deliberately: the panel spec allows nothing else in serial mode
+ * (see epd_bitbang.h), so the transcription of DEV_SPI_ReadByte() that used to
+ * live here is gone.
  */
 #include "driver/gpio.h"
 #include "esp_check.h"
@@ -169,57 +172,6 @@ void epd_bb_data(const uint8_t *p, size_t n)
     epd_bb_set_dc(1);
     for (size_t i = 0; i < n; i++) {
         epd_bb_write_byte(p[i]);
-    }
-}
-
-/* DEV_SPI_ReadByte(): MOSI to input, CS low, then for each bit shift the
- * accumulator left, sample MOSI *before* the clock pulse, pulse SCK, then CS
- * high and MOSI back to output. The sample-before-clock order matters: the
- * controller presents the next bit on the falling edge, so the level valid
- * during a bit time is the one standing before that bit's rising edge. */
-uint8_t epd_bb_read_byte(void)
-{
-    if (!s_bb.data_ready) {
-        return 0xFF;
-    }
-
-    uint8_t j = 0xFF;
-
-    /* GPIO_Mode(EPD_MOSI_PIN, 0): plain input, no pull, so the controller's
-     * driver alone decides the level and an undriven line stays visibly
-     * ambiguous instead of being forced by the ESP32. */
-    gpio_set_direction(s_bb.mosi, GPIO_MODE_INPUT);
-    esp_rom_delay_us(EPD_BB_EDGE_US);
-
-    gpio_set_level(s_bb.cs, 0);
-    esp_rom_delay_us(EPD_BB_EDGE_US);
-    for (int i = 0; i < 8; i++) {
-        j = (uint8_t)(j << 1);
-        if (gpio_get_level(s_bb.mosi)) {
-            j = (uint8_t)(j | 0x01u);
-        } else {
-            j = (uint8_t)(j & 0xFEu);
-        }
-        gpio_set_level(s_bb.sck, 1);
-        esp_rom_delay_us(EPD_BB_EDGE_US);
-        gpio_set_level(s_bb.sck, 0);
-        esp_rom_delay_us(EPD_BB_EDGE_US);
-    }
-    gpio_set_level(s_bb.cs, 1);
-
-    gpio_set_direction(s_bb.mosi, GPIO_MODE_OUTPUT);
-    return j;
-}
-
-void epd_bb_read(uint8_t cmd, uint8_t *out, size_t n)
-{
-    if (out == NULL) {
-        return;
-    }
-    epd_bb_cmd(cmd);
-    epd_bb_set_dc(1);
-    for (size_t i = 0; i < n; i++) {
-        out[i] = epd_bb_read_byte();
     }
 }
 

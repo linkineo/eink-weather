@@ -1,0 +1,26 @@
+menu "eink-weather bring-up"
+
+    config APP_DIAG_ONLY
+        bool "Run the D/C oracle diagnostics instead of displaying; never refreshes the panel"
+        default n
+        help
+            Electrical diagnostic mode. app_main() prints the boot banner, runs
+            epd_dc_diag() over bit-banged GPIO and stops: no epd_init(), no
+            epd_display(), no refresh, ever. The panel is left powered off (POF)
+            and in its post-reset idle state, so the mode is safe to repeat as
+            often as needed -- unlike a refresh, which ages the glass and must
+            stay rare.
+
+            The question it answers: does the controller see the D/C line at
+            all? Single-byte commands (PON, DRF, POF) demonstrably work on this
+            board while every data byte -- init parameters and image bytes
+            alike -- appears to be ignored, which is exactly what a D/C line
+            stuck low at the controller would look like: every byte is then
+            read as a command.
+
+            epd_dc_diag() answers it without refreshing by using the BUSY
+            power-on signature as an oracle: it sends 0x04 (PON) sometimes as a
+            command and sometimes as a data byte and watches whether the
+            controller powers up. See components/epd_uc8179/epd_diag.c.
+
+endmenu

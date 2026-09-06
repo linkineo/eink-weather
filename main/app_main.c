@@ -7,6 +7,12 @@
  * per boot (Waveshare rule: never leave the panel powered, keep refreshes
  * rare), then a heartbeat every 10 s forever.
  *
+ * CONFIG_APP_DIAG_ONLY replaces the display bring-up with the D/C line
+ * diagnostic (epd_dc_diag(), components/epd_uc8179/epd_diag.c) and nothing
+ * else: no bus, no epd_init(), no image, no refresh. That build exists to
+ * answer an electrical question about the panel connector and is safe to run
+ * as often as needed; the display build is not.
+ *
  * All machine-readable output follows the log contract in test_log.h, and
  * every [EPD-TEST] line is printed from this task only - the driver logs
  * through ESP_LOG* so the two streams cannot interleave inside a line.
@@ -30,13 +36,28 @@
 
 #include "board.h"
 #include "epd_uc8179.h"
-#include "gfx.h"
 #include "test_log.h"
+
+#if !CONFIG_APP_DIAG_ONLY
+#include "gfx.h"
+#endif
 
 #define HEARTBEAT_PERIOD_MS 10000
 
 static const char *TAG = "app";
 
+/* Pin map for both modes. */
+static const epd_pins_t k_pins = {
+    .sck    = BOARD_EPD_SCK,
+    .mosi   = BOARD_EPD_MOSI,
+    .cs     = BOARD_EPD_CS,
+    .dc     = BOARD_EPD_DC,
+    .rst    = BOARD_EPD_RST,
+    .busy   = BOARD_EPD_BUSY,
+    .spi_hz = BOARD_EPD_SPI_HZ,
+};
+
+#if !CONFIG_APP_DIAG_ONLY
 /* The two 1-bpp planes. 48000 bytes each is far too much for any task stack,
  * and .bss on internal RAM is exactly what the SPI driver prefers (DMA
  * capable), so they are static. */
@@ -44,7 +65,9 @@ _Static_assert(GFX_PLANE_BYTES == EPD_PLANE_BYTES,
                "gfx and epd_uc8179 disagree about the plane size");
 static uint8_t s_black[GFX_PLANE_BYTES];
 static uint8_t s_red[GFX_PLANE_BYTES];
+#endif
 
+#if !CONFIG_APP_DIAG_ONLY
 /*===========================================================================
  * Layout of the bring-up image (800 x 480)
  *
@@ -71,6 +94,7 @@ static uint8_t s_red[GFX_PLANE_BYTES];
 #define LAYOUT_DISC_R       40
 
 static const char k_title[] = "Hello, World!";
+#endif /* !CONFIG_APP_DIAG_ONLY */
 
 /*===========================================================================
  * Chip / reset helpers, shared by the UART banner and the panel image
@@ -166,6 +190,7 @@ static void print_boot_banner(void)
                  esp_get_free_heap_size());
 }
 
+#if !CONFIG_APP_DIAG_ONLY
 /*===========================================================================
  * Image composition
  *===========================================================================*/
@@ -251,26 +276,16 @@ static void compose_black(const epd_probe_result_t *probe)
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
 
-    /* chip_rev and the temperature come from register reads. When those come
-     * back from an undriven line (probe->reads_ok false) they are garbage, so
-     * the panel says n/a rather than showing a number that looks real. */
-    char chip_rev[8];
-    char temp[8];
-    if (probe->reads_ok) {
-        snprintf(chip_rev, sizeof(chip_rev), "0x%02X", probe->rev[6]);
-        snprintf(temp, sizeof(temp), "%dC", (int)probe->temp_c);
-    } else {
-        snprintf(chip_rev, sizeof(chip_rev), "n/a");
-        snprintf(temp, sizeof(temp), "n/a");
-    }
-
-    snprintf(buf, sizeof(buf), "Panel %s  chip_rev %s",
-             epd_panel_name(), chip_rev);
+    /* No chip revision and no panel temperature here: both would have to come
+     * from a register read, and this controller answers none (serial mode is
+     * write-only per the panel spec). Everything the panel shows about itself
+     * is either a compile-time constant or a BUSY-pin observation. */
+    snprintf(buf, sizeof(buf), "Panel %s", epd_panel_name());
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
 
-    snprintf(buf, sizeof(buf), "probe %s  T=%s  busy %d/%d ms",
-             probe->verdict, temp,
+    snprintf(buf, sizeof(buf), "probe %s  busy %d/%d ms",
+             probe->verdict,
              probe->busy_low_ms, probe->busy_release_ms);
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
@@ -326,29 +341,18 @@ static void compose_red(void)
  */
 static esp_err_t display_bringup(void)
 {
-    static const epd_pins_t pins = {
-        .sck    = BOARD_EPD_SCK,
-        .mosi   = BOARD_EPD_MOSI,
-        .cs     = BOARD_EPD_CS,
-        .dc     = BOARD_EPD_DC,
-        .rst    = BOARD_EPD_RST,
-        .busy   = BOARD_EPD_BUSY,
-        .spi_hz = BOARD_EPD_SPI_HZ,
-    };
-
     /*
-     * The probe runs first and on bit-banged GPIO: it reads registers, which
-     * the SPI peripheral cannot do on this 3-wire bus, and it releases
-     * SCK/MOSI/CS again on the way out so epd_bus_init() can claim them.
+     * The probe runs first and on bit-banged GPIO: it drives the pins by hand
+     * and releases SCK/MOSI/CS again on the way out so epd_bus_init() can
+     * claim them.
      *
-     * It is informational: a UC8179 whose register reads come back as 0xFF
-     * can still drive the panel perfectly, so the refresh is attempted
-     * whatever the verdict. A transport-level failure is reported through
-     * ESP_LOGW rather than an [EPD-TEST] ERROR line, which would stop the
-     * capture before the refresh that this run is about.
+     * It is informational: the refresh is attempted whatever the verdict. A
+     * transport-level failure is reported through ESP_LOGW rather than an
+     * [EPD-TEST] ERROR line, which would stop the capture before the refresh
+     * that this run is about.
      */
     epd_probe_result_t probe;
-    esp_err_t probe_err = epd_probe(&pins, &probe);
+    esp_err_t probe_err = epd_probe(&k_pins, &probe);
     if (probe_err != ESP_OK) {
         ESP_LOGW(TAG, "epd_probe() failed: %s (continuing anyway)",
                  esp_err_to_name(probe_err));
@@ -358,7 +362,7 @@ static esp_err_t display_bringup(void)
     epd_probe_format(&probe, line, sizeof(line));
     EPD_TEST_LOG("%s", line);
 
-    esp_err_t err = epd_bus_init(&pins);
+    esp_err_t err = epd_bus_init(&k_pins);
     if (err != ESP_OK) {
         EPD_TEST_LOG("ERROR stage=bus err=%s", esp_err_to_name(err));
         return err;
@@ -398,16 +402,53 @@ static esp_err_t display_bringup(void)
 
     return ESP_OK;
 }
+#endif /* !CONFIG_APP_DIAG_ONLY */
+
+#if CONFIG_APP_DIAG_ONLY
+/*===========================================================================
+ * Diagnostic mode (CONFIG_APP_DIAG_ONLY)
+ *===========================================================================*/
+
+/*
+ * Runs the D/C oracles and prints the one-line result. Deliberately the whole
+ * of what this build does to the panel: no epd_bus_init(), no epd_init(), no
+ * epd_display(), no refresh. epd_dc_diag() leaves the panel powered off and
+ * reset, so this may be repeated as often as the investigation needs.
+ */
+static esp_err_t dc_diag_only(void)
+{
+    epd_dc_diag_result_t diag;
+    esp_err_t err = epd_dc_diag(&k_pins, &diag);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "epd_dc_diag() failed: %s", esp_err_to_name(err));
+        EPD_TEST_LOG("ERROR stage=dcdiag err=%s", esp_err_to_name(err));
+        return err;
+    }
+
+    char line[256];
+    epd_dc_diag_format(&diag, line, sizeof(line));
+    EPD_TEST_LOG("%s", line);
+
+    return ESP_OK;
+}
+#endif /* CONFIG_APP_DIAG_ONLY */
 
 void app_main(void)
 {
     print_boot_banner();
 
+#if CONFIG_APP_DIAG_ONLY
+    /* Diagnostic build: the panel is never refreshed, only questioned. */
+    if (dc_diag_only() == ESP_OK) {
+        EPD_TEST_LOG("DONE");
+    }
+#else
     /* One refresh per boot: the panel is asleep from here on and this firmware
      * never wakes it again. */
     if (display_bringup() == ESP_OK) {
         EPD_TEST_LOG("DONE");
     }
+#endif
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS));

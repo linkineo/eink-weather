@@ -3,21 +3,26 @@
  *
  * Why this exists next to the SPI peripheral driver in epd_bus.c:
  *
- *  - Register reads. The controller shares one SDA line for both directions.
- *    Wave 2 tried to do that with the ESP32 SPI peripheral configured
- *    SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_3WIRE and every read came back as a
- *    floating line (0x7F 0xFF ...). Waveshare's own ESP32 port never uses the
- *    peripheral at all: DEV_SPI_WriteByte()/DEV_SPI_ReadByte() in
- *    DEV_Config.cpp toggle the pins by hand. The bit-level behaviour below is
- *    a transcription of those two functions, so reads follow a path that is
- *    known to work on exactly this board.
+ *  - Byte-exact control of CS, SCK, MOSI and D/C, which the diagnostics need:
+ *    epd_probe() and epd_dc_diag() place individual bytes with a chosen D/C
+ *    level and time the BUSY response, rather than running transactions. The
+ *    bit-level behaviour below is a transcription of DEV_SPI_WriteByte() in
+ *    Waveshare's own ESP32 port (DEV_Config.cpp), which never uses the SPI
+ *    peripheral at all, so it follows a path known to work on this board.
  *
- *  - The probe therefore runs *before* the SPI bus exists: it calls
- *    epd_bb_init(), talks to the controller, then epd_bb_release() hands
+ *  - Those diagnostics therefore run *before* the SPI bus exists: they call
+ *    epd_bb_init(), talk to the controller, then epd_bb_release() hands
  *    SCK/MOSI/CS back so epd_bus_init() can give them to the peripheral.
  *
  *  - CONFIG_EPD_DATA_BITBANG additionally routes commands and image data
  *    through this module, as a diagnostic fallback (slow: ~1 s per plane).
+ *
+ * There is no read side, and there will not be one: the 7.5inch e-Paper V2
+ * specification says for both serial modes that "under serial mode, only
+ * write operations are allowed". Wave 2 tried reads through the SPI
+ * peripheral (SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_3WIRE) and wave 3 through a
+ * transcription of DEV_SPI_ReadByte(); both got back the last bit the ESP32
+ * had driven on the shared SDA line, never controller data.
  *
  * This module also owns the control pins (RST, DC, BUSY) for both transports,
  * so the reset pulse and the BUSY sampling exist in exactly one place.
@@ -64,15 +69,6 @@ void epd_bb_cmd(uint8_t cmd);
 
 /* n data bytes: DC high, then the bytes. */
 void epd_bb_data(const uint8_t *p, size_t n);
-
-/* One byte in from the shared SDA line (DEV_Config.cpp DEV_SPI_ReadByte()):
- * MOSI switched to input, CS asserted, each bit sampled *before* its clock
- * pulse, then MOSI switched back to output. DC is not touched. */
-uint8_t epd_bb_read_byte(void);
-
-/* Register read: command byte with DC low, then n bytes back with DC high.
- * CS is toggled per byte, exactly like the Waveshare reference. */
-void epd_bb_read(uint8_t cmd, uint8_t *out, size_t n);
 
 /* Hardware reset pulse: RST high 200 ms, low 5 ms, high 200 ms -- the timing
  * of the tri-colour reference driver EPD_7in5b_V2.c:40-48. */
