@@ -29,7 +29,9 @@ bring-up** — boot banner on UART, panel probe, "Hello, World!" on the panel. N
   | RST | 26 | active low |
   | BUSY | 25 | input, **low = busy** |
 
-  No panel power pin: the panel's 3.3 V comes from an always-on LDO.
+  Panel power: the schematic has a MOSFET switch (GPIO2 → R35 → Q32 → Q31) in front of the
+  `EPD_3.3V` LDO and the Waveshare Loader drives GPIO2 and GPIO33 high; the firmware does the same
+  (`BOARD_EPD_PWR`, `BOARD_EPD_PWR_AUX`), but on this unit it changed nothing measurable.
 - Switches: **SW1 "Display Config" must be on A (0.47 Ω)** for 7.5" panels (B = 3 Ω is for the
   small 1.54/2.13/2.9 b/w panels). **SW2 (USB-UART power) must stay ON** or flashing stops working.
 - Panel safety rules (Waveshare): put the panel to **deep sleep after every refresh** (long
@@ -107,8 +109,19 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
    two runs. The controller executes every byte as a command: the D/C line never reaches it high.
    ESP32 pads read back correctly (no short on the board side), so the fault is an open somewhere
    between GPIO27 and the panel's FPC pin 11 (panel FPC → adapter board → FFC → board connector),
-   or a wrong bus-select strap. Next: reseat / bypass the adapter+FFC (panel FPC directly into the
-   board's connector), rerun the diag capture, then the normal display build.
+   or a wrong bus-select strap.
+4. **Run 4** (panel FPC plugged directly into the board, no adapter/FFC): identical `DC_NOT_SEEN`.
+   RST oracle inconclusive (POF pulses BUSY 41 ms whatever the power state, so it cannot tell a
+   reset controller from a powered one; BUSY never moves during the RST pulse). D/C GPIO scan over
+   2,4,5,16,17,18,19,21,22,23,32,33: none honoured → D/C is not routed to another GPIO.
+5. **Run 5** (GPIO2 and GPIO33 driven high like the Waveshare Loader's `EPD_initSPI()`; the
+   schematic shows GPIO2 → R35 → Q32 → Q31 → LDO `EPD_3.3V`): no change at all, same timings to
+   the millisecond → the panel rail was already on; GPIO2 gates nothing measurable on this unit.
+   The Loader's 7.5 (B) V2 init/show/load sequence is identical to ours (PSR 0x0F, CDI 11 07,
+   black plane as-is in 0x10, red plane inverted in 0x13), so no driver/panel mismatch either.
+   Everything software-side is exhausted: the controller decodes 8-bit command frames (4-wire
+   mode) but its D/C input reads low → open on FPC pin 11 (board connector / trace / panel flex).
+   Physical checks pending: continuity IO27 ↔ connector pin 11, inspection of contacts 10–11.
 
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a

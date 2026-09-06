@@ -24,8 +24,9 @@
  * transcription of DEV_SPI_ReadByte(); both got back the last bit the ESP32
  * had driven on the shared SDA line, never controller data.
  *
- * This module also owns the control pins (RST, DC, BUSY) for both transports,
- * so the reset pulse and the BUSY sampling exist in exactly one place.
+ * This module also owns the control pins (RST, DC, BUSY) and the panel power
+ * rail for both transports, so the reset pulse, the BUSY sampling and the
+ * power-up exist in exactly one place.
  *
  * None of these functions is re-entrant; a single task must own the panel.
  */
@@ -36,10 +37,18 @@
 #include "esp_err.h"
 #include "epd_uc8179.h"
 
-/* Configure the control pins only: RST and DC as outputs (RST high because
- * reset is active low, DC low), BUSY as an input with the internal pull-down
- * so a missing panel reads 0 deterministically instead of floating. Leaves
- * SCK/MOSI/CS untouched, which is what the SPI data path wants. */
+/* Drive both panel power pins (epd_pins_t::pwr / ::pwr_aux), active high; a
+ * pin given as -1 is skipped and a call before epd_power_init() does nothing.
+ * The public epd_power() wraps this and adds the one-off settling delay --
+ * prefer it. This raw form exists for callers that already hold the rail up. */
+void epd_bb_set_power(int on);
+
+/* Configure the control pins: the panel power rail first (epd_power_init()
+ * plus epd_power(true), so nothing below talks to an unpowered controller),
+ * then RST and DC as outputs (RST high because reset is active low, DC low)
+ * and BUSY as an input with the internal pull-down so a missing panel reads 0
+ * deterministically instead of floating. Leaves SCK/MOSI/CS untouched, which
+ * is what the SPI data path wants. */
 esp_err_t epd_bb_init_ctrl(const epd_pins_t *pins);
 
 /* epd_bb_init_ctrl() plus SCK/MOSI/CS as plain GPIO outputs, idling at
@@ -59,6 +68,14 @@ bool epd_bb_data_ready(void);
 
 /* Drive the DC line directly: 0 = command, 1 = data. */
 void epd_bb_set_dc(int level);
+
+/* Diagnostic hook: mirror every D/C level change onto a second GPIO, so that
+ * epd_bb_cmd() / epd_bb_data() drive a candidate pin exactly like the real
+ * D/C pin. Used by the D/C GPIO scan (epd_diag.c) to ask "would the controller
+ * honour D/C if it were wired to GPIO n?" without duplicating the transport.
+ * The caller owns the pin and must have configured it as an output before
+ * enabling the mirror; -1 disables it. Both inits clear it. */
+void epd_bb_set_dc_mirror(int gpio);
 
 /* One byte out, MSB first, CS asserted for the byte
  * (DEV_Config.cpp DEV_SPI_WriteByte()). DC is *not* touched. */

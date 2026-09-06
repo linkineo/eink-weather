@@ -1,15 +1,15 @@
 menu "eink-weather bring-up"
 
     config APP_DIAG_ONLY
-        bool "Run the D/C oracle diagnostics instead of displaying; never refreshes the panel"
+        bool "Run the panel wiring diagnostics instead of displaying; never refreshes the panel"
         default n
         help
             Electrical diagnostic mode. app_main() prints the boot banner, runs
-            epd_dc_diag() over bit-banged GPIO and stops: no epd_init(), no
-            epd_display(), no refresh, ever. The panel is left powered off (POF)
-            and in its post-reset idle state, so the mode is safe to repeat as
-            often as needed -- unlike a refresh, which ages the glass and must
-            stay rare.
+            epd_dc_diag(), epd_rst_diag() and epd_dcscan() over bit-banged GPIO
+            and stops: no epd_init(), no epd_display(), no refresh, ever. The
+            panel is left powered off (POF) and in its post-reset idle state,
+            so the mode is safe to repeat as often as needed -- unlike a
+            refresh, which ages the glass and must stay rare.
 
             The question it answers: does the controller see the D/C line at
             all? Single-byte commands (PON, DRF, POF) demonstrably work on this
@@ -22,5 +22,13 @@ menu "eink-weather bring-up"
             power-on signature as an oracle: it sends 0x04 (PON) sometimes as a
             command and sometimes as a data byte and watches whether the
             controller powers up. See components/epd_uc8179/epd_diag.c.
+
+            The other two narrow down the answer. epd_rst_diag() asks whether
+            the hardware reset pulse reaches the controller at all -- RST and
+            D/C are adjacent contacts on the panel FPC, so two dead lines mean
+            a mechanical fault where one dead line does not -- by timing the
+            BUSY_N low pulse that POF produces with and without a reset in
+            between. epd_dcscan() drives each free GPIO as a second D/C line
+            in turn, to exclude a board revision that wires D/C elsewhere.
 
 endmenu

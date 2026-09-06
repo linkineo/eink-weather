@@ -23,9 +23,27 @@ identify the chip and drive the panel.
 | DC     | 27   |
 | RST    | 26   |
 | BUSY   | 25   |
+| PWR (panel rail enable) | 2 |
+| PWR aux (header only)   | 33 |
 
-SPI clock at bring-up is 4 MHz. There is no software-controlled panel power pin
-on this board. See `main/board.h`.
+SPI clock at bring-up is 4 MHz. See `main/board.h`.
+
+**The panel has a software-controlled power rail, and it must be switched on
+first.** GPIO2 runs through R35 to the base of Q32, which drives the P-MOSFET
+Q31 in front of the RT9193 LDO that produces the panel rail `EPD_3.3V`: GPIO2
+high = panel powered, and the reset state (low) leaves the panel dark.
+Waveshare's own "Loader" firmware for this board calls the pin `PIN_SPI_CS_S`
+and drives it high in `EPD_initSPI()` before it configures any other pin;
+`PIN_SPI_PWR` (GPIO33) goes high in the same place and only reaches the
+expansion header here, but is driven high too for parity. The driver raises
+both at the top of `epd_bb_init_ctrl()`, so `epd_probe()`, `epd_dc_diag()`,
+`epd_rst_diag()`, `epd_dcscan()` and `epd_bus_init()` all get power before
+they touch a pin; `epd_power(bool)` switches the rail explicitly, and waits
+200 ms the first time it comes up. Before wave 6 this pin was left low: the
+controller ran on the leakage current of the signal lines, which is enough to
+answer commands on BUSY (PON, DRF, POF all worked) but not to latch D/C or a
+single data byte — so every diagnostic read `verdict=DC_NOT_SEEN` and every
+refresh produced noise.
 
 **The controller cannot be read back, and the firmware no longer tries.**
 The 7.5inch e-Paper V2 specification says it twice, once for each serial mode:
@@ -100,8 +118,11 @@ and watches BUSY for 400 ms each time:
 | E (polarity) | a lone `0x04` with DC=1 | D/C ignored, or inverted |
 
 `verdict=DC_OK` (D yes, the rest no) means the line is fine and the noise has
-another cause; `DC_NOT_SEEN` (all four yes) points at the connector, not the
-firmware; `DC_INVERTED` (D no, E yes) means the sense is reversed. A pad check
+another cause; `DC_NOT_SEEN` (all four yes) points at the connector — or, as
+it turned out here, at the panel power rail: a controller running on the
+leakage current of its signal lines produces exactly this result, so check
+that `[EPD-TEST] pwr gpio2=1` is in the capture before suspecting the
+hardware. `DC_INVERTED` (D no, E yes) means the sense is reversed. A pad check
 on GPIO 27/26/15/13/14 runs first, with the panel held in reset, and reports
 the read-back of each pin driven high and low (`1/0` = healthy).
 
@@ -127,7 +148,8 @@ components/gfx/        1-bpp framebuffer and drawing primitives
 components/epd_uc8179/ UC8179 panel driver: epd_bus.c (write path, plain
                        full-duplex SPI), epd_bitbang.c (write-only GPIO
                        transport for the diagnostics, and owner of
-                       RST/DC/BUSY), epd_uc8179.c (probe, init / display /
+                       RST/DC/BUSY and the panel power rail),
+                       epd_uc8179.c (probe, init / display /
                        sleep sequences), epd_diag.c (D/C oracles, no refresh).
                        Kconfig: panel variant, BUSY timeout, SPI clock,
                        EPD_DATA_BITBANG
@@ -147,6 +169,9 @@ The firmware prints machine-readable lines prefixed with `[EPD-TEST] `
 (see `main/test_log.h`). `tools/capture.py` parses them:
 
 - `[EPD-TEST] boot chip=... mac=... idf=... reset=... heap=...` — boot banner
+- `[EPD-TEST] pwr gpio2=1 gpio33=1` — the panel power rail is up and settled.
+  Printed by both builds, immediately after the banner and before anything
+  else touches a panel pin (see the hardware section above)
 - `[EPD-TEST] probe verdict=PRESENT|ABSENT|UNCERTAIN busy_after_reset=.
   busy_low_ms=.. busy_release_ms=..` — controller probe (one line).
   `busy_low_ms` / `busy_release_ms` are the low-then-high BUSY signature after
@@ -167,7 +192,7 @@ The firmware prints machine-readable lines prefixed with `[EPD-TEST] `
   (≈ 15000–25000 ms on the tri-colour panel, ≈ 4000 ms would mean a b/w LUT)
 - `[EPD-TEST] sleep ok` — panel back in deep sleep
 - `[EPD-TEST] DONE` — success marker, capture stops here (exit 0)
-- `[EPD-TEST] ERROR stage=bus|init|display|sleep|dcdiag err=ESP_ERR_...` —
+- `[EPD-TEST] ERROR stage=power|bus|init|display|sleep|dcdiag err=ESP_ERR_...` —
   failure marker (exit 1); `stage=display err=ESP_ERR_TIMEOUT` means BUSY never
   released
 - `[EPD-TEST] alive uptime=Ns heap=N` — heartbeat every 10 s

@@ -10,6 +10,8 @@
  *
  * Call order, and it matters:
  *
+ *     epd_power_init(&pins); epd_power(true);  // panel rail up (implicit in
+ *                                              // every entry point below)
  *     epd_probe(&pins, &result);   // bit-banged GPIO, must come FIRST
  *     epd_bus_init(&pins);         // hands SCK/MOSI/CS to the SPI peripheral
  *     epd_init(); ... epd_display(...); epd_sleep();
@@ -37,7 +39,38 @@
 #define EPD_HEIGHT 480
 #define EPD_PLANE_BYTES (EPD_WIDTH * EPD_HEIGHT / 8)   /* 48000 */
 
-typedef struct { int sck, mosi, cs, dc, rst, busy; int spi_hz; } epd_pins_t;
+/* Pin map. pwr / pwr_aux are the panel power enable lines (active high),
+ * -1 when a board revision does not have one -- see epd_power(). */
+typedef struct {
+    int sck, mosi, cs, dc, rst, busy;
+    int pwr, pwr_aux;
+    int spi_hz;
+} epd_pins_t;
+
+/*----------------------------------------------------------- panel power ----
+ * On this board revision the panel's 3.3 V rail hangs off an LDO that a plain
+ * GPIO switches (board.h: GPIO2 -> R35 -> Q32 -> Q31 -> LDO). Nothing below
+ * works before that rail is up: with the pin low the controller runs on the
+ * leakage current of the signal lines, answers commands on BUSY, and ignores
+ * D/C and every data byte -- which is exactly the failure this driver chased
+ * for three waves.
+ *
+ * Every entry point that configures the control pins (epd_probe(),
+ * epd_dc_diag(), epd_rst_diag(), epd_dcscan(), epd_bus_init()) powers the
+ * panel first, so callers do not have to. These two exist so that the
+ * application can do it explicitly at boot and switch the rail off again for
+ * deep sleep.
+ *---------------------------------------------------------------------------*/
+
+/* Remember the pin map and configure the power pins as outputs. Switches
+ * nothing on its own. Safe to call more than once; a pin already driven keeps
+ * its level. pins must not be NULL. */
+esp_err_t epd_power_init(const epd_pins_t *pins);
+
+/* Switch the panel rail. The first switch-on also waits for the LDO to
+ * settle. Returns ESP_ERR_INVALID_STATE before epd_power_init(); a board with
+ * no power pin (pwr and pwr_aux both -1) succeeds and does nothing. */
+esp_err_t epd_power(bool on);
 
 typedef struct {
     bool    present;            /* verdict == PRESENT */
@@ -101,6 +134,64 @@ esp_err_t epd_dc_diag(const epd_pins_t *pins, epd_dc_diag_result_t *out);
 
 /* One-line summary of a diagnostic result, for the [EPD-TEST] log. */
 void      epd_dc_diag_format(const epd_dc_diag_result_t *r, char *buf, size_t len);
+
+/*--------------------------------------------------- RST line diagnostic ----
+ * Does the hardware reset pulse reach the controller? Nothing has ever proved
+ * it: commands, BUSY and power are proven, but every reset so far could have
+ * been a no-op without changing a single observation. The oracle is the length
+ * of the BUSY_N low pulse that POF produces -- long on a still-powered
+ * controller, absent or very short on one whose rails a reset has just cleared.
+ * See components/epd_uc8179/epd_diag.c.
+ *---------------------------------------------------------------------------*/
+
+/* BUSY-low duration reported as -1 when BUSY never went low at all. */
+typedef struct {
+    epd_pon_watch_t pon_ref;        /* control power-on, before the reference POF */
+    int  pof_ref_ms;                /* POF BUSY-low duration with no reset in between */
+    int  pof_off_ms;                /* POF BUSY-low duration with the rails already off */
+    epd_pon_watch_t pon_rst;        /* power-on of the RST variant, before the pulse */
+    bool busy_low_during_rst;       /* BUSY_N went low while RST_N was held low */
+    int  busy_after_rst;            /* BUSY level once the RST pulse has settled */
+    int  pof_after_rst_ms;          /* POF BUSY-low duration after the RST pulse */
+    epd_pon_watch_t pon_after_rst;  /* PON repeated right after an RST pulse */
+    bool pof_oracle_usable;         /* the POF pulse length does depend on the power state */
+    bool rst_effective;             /* the reset pulse demonstrably reached the controller */
+} epd_rst_diag_result_t;
+/* rst_effective is one-sided: "yes" is proof, "no" only means no proof was
+ * obtained -- and when pof_oracle_usable is false it means nothing at all,
+ * because POF then pulses BUSY whatever the power state. */
+
+/* Run the RST oracle over bit-banged GPIO; same constraints as epd_dc_diag()
+ * (before epd_bus_init(), no refresh, ends powered off and reset). */
+esp_err_t epd_rst_diag(const epd_pins_t *pins, epd_rst_diag_result_t *out);
+
+/* One-line summary of an RST diagnostic result, for the [EPD-TEST] log. */
+void      epd_rst_diag_format(const epd_rst_diag_result_t *r, char *buf, size_t len);
+
+/*------------------------------------------------------- D/C GPIO scan -----
+ * Excludes the last innocent explanation for DC_NOT_SEEN: a board revision
+ * that routes D/C to some other GPIO. Each candidate is driven as a second
+ * D/C line alongside GPIO27 and asked the question of oracle A -- a candidate
+ * that is really wired to the controller's D/C input makes the CDI parameter
+ * stay a parameter, so the panel does NOT power on.
+ *---------------------------------------------------------------------------*/
+
+#define EPD_DCSCAN_MAX 16   /* capacity of the candidate table below */
+
+typedef struct {
+    int             n;                     /* candidates actually tested */
+    int             gpio[EPD_DCSCAN_MAX];  /* the candidate pins, in test order */
+    epd_pon_watch_t watch[EPD_DCSCAN_MAX]; /* pon=no means the candidate acted as D/C */
+    int             found;                 /* first candidate honoured as D/C, -1 = none */
+} epd_dcscan_result_t;
+
+/* Scan the candidate GPIOs for a D/C line. Same constraints as epd_dc_diag().
+ * Every candidate is returned to its default state (input, pull-up) on the
+ * way out; the real D/C pin stays a driven output. */
+esp_err_t epd_dcscan(const epd_pins_t *pins, epd_dcscan_result_t *out);
+
+/* One-line summary of a scan result, for the [EPD-TEST] log. */
+void      epd_dcscan_format(const epd_dcscan_result_t *r, char *buf, size_t len);
 
 /* Configure the write path to the panel; call once, after epd_probe(). */
 esp_err_t epd_bus_init(const epd_pins_t *pins);

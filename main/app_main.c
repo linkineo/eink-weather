@@ -1,17 +1,18 @@
 /*
  * app_main.c - hardware bring-up firmware.
  *
- * Boot banner on UART, then the display bring-up: controller probe (bit-banged
- * GPIO, must precede the bus), write path, panel init, one composed
- * "Hello, World!" image, panel back to deep sleep. Exactly ONE panel refresh
- * per boot (Waveshare rule: never leave the panel powered, keep refreshes
- * rare), then a heartbeat every 10 s forever.
+ * Boot banner on UART, panel power rail up, then the display bring-up:
+ * controller probe (bit-banged GPIO, must precede the bus), write path, panel
+ * init, one composed "Hello, World!" image, panel back to deep sleep. Exactly
+ * ONE panel refresh per boot (Waveshare rule: never leave the panel powered,
+ * keep refreshes rare), then a heartbeat every 10 s forever.
  *
- * CONFIG_APP_DIAG_ONLY replaces the display bring-up with the D/C line
- * diagnostic (epd_dc_diag(), components/epd_uc8179/epd_diag.c) and nothing
- * else: no bus, no epd_init(), no image, no refresh. That build exists to
- * answer an electrical question about the panel connector and is safe to run
- * as often as needed; the display build is not.
+ * CONFIG_APP_DIAG_ONLY replaces the display bring-up with the electrical
+ * diagnostics of components/epd_uc8179/epd_diag.c -- epd_dc_diag(),
+ * epd_rst_diag(), epd_dcscan() -- and nothing else: no bus, no epd_init(), no
+ * image, no refresh. That build exists to answer electrical questions about
+ * the panel connector and is safe to run as often as needed; the display
+ * build is not.
  *
  * All machine-readable output follows the log contract in test_log.h, and
  * every [EPD-TEST] line is printed from this task only - the driver logs
@@ -48,13 +49,15 @@ static const char *TAG = "app";
 
 /* Pin map for both modes. */
 static const epd_pins_t k_pins = {
-    .sck    = BOARD_EPD_SCK,
-    .mosi   = BOARD_EPD_MOSI,
-    .cs     = BOARD_EPD_CS,
-    .dc     = BOARD_EPD_DC,
-    .rst    = BOARD_EPD_RST,
-    .busy   = BOARD_EPD_BUSY,
-    .spi_hz = BOARD_EPD_SPI_HZ,
+    .sck     = BOARD_EPD_SCK,
+    .mosi    = BOARD_EPD_MOSI,
+    .cs      = BOARD_EPD_CS,
+    .dc      = BOARD_EPD_DC,
+    .rst     = BOARD_EPD_RST,
+    .busy    = BOARD_EPD_BUSY,
+    .pwr     = BOARD_EPD_PWR,
+    .pwr_aux = BOARD_EPD_PWR_AUX,
+    .spi_hz  = BOARD_EPD_SPI_HZ,
 };
 
 #if !CONFIG_APP_DIAG_ONLY
@@ -410,13 +413,23 @@ static esp_err_t display_bringup(void)
  *===========================================================================*/
 
 /*
- * Runs the D/C oracles and prints the one-line result. Deliberately the whole
- * of what this build does to the panel: no epd_bus_init(), no epd_init(), no
- * epd_display(), no refresh. epd_dc_diag() leaves the panel powered off and
- * reset, so this may be repeated as often as the investigation needs.
+ * Runs the three electrical diagnostics in order and prints one line each:
+ *
+ *   dctest   does the controller see the D/C line at all?
+ *   rsttest  does the hardware reset pulse reach the controller? (RST and D/C
+ *            are adjacent contacts on the panel FPC: whether both are dead
+ *            decides between a mechanical fault and a single broken line)
+ *   dcscan   is D/C wired to a different GPIO on this board revision?
+ *
+ * Deliberately the whole of what this build does to the panel: no
+ * epd_bus_init(), no epd_init(), no epd_display(), no refresh. Each of the
+ * three leaves the panel powered off and reset, so the sequence may be
+ * repeated as often as the investigation needs.
  */
-static esp_err_t dc_diag_only(void)
+static esp_err_t diag_only(void)
 {
+    char line[256];
+
     epd_dc_diag_result_t diag;
     esp_err_t err = epd_dc_diag(&k_pins, &diag);
     if (err != ESP_OK) {
@@ -424,28 +437,74 @@ static esp_err_t dc_diag_only(void)
         EPD_TEST_LOG("ERROR stage=dcdiag err=%s", esp_err_to_name(err));
         return err;
     }
-
-    char line[256];
     epd_dc_diag_format(&diag, line, sizeof(line));
+    EPD_TEST_LOG("%s", line);
+
+    epd_rst_diag_result_t rst;
+    err = epd_rst_diag(&k_pins, &rst);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "epd_rst_diag() failed: %s", esp_err_to_name(err));
+        EPD_TEST_LOG("ERROR stage=rstdiag err=%s", esp_err_to_name(err));
+        return err;
+    }
+    epd_rst_diag_format(&rst, line, sizeof(line));
+    EPD_TEST_LOG("%s", line);
+
+    epd_dcscan_result_t scan;
+    err = epd_dcscan(&k_pins, &scan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "epd_dcscan() failed: %s", esp_err_to_name(err));
+        EPD_TEST_LOG("ERROR stage=dcscan err=%s", esp_err_to_name(err));
+        return err;
+    }
+    epd_dcscan_format(&scan, line, sizeof(line));
     EPD_TEST_LOG("%s", line);
 
     return ESP_OK;
 }
 #endif /* CONFIG_APP_DIAG_ONLY */
 
+/*
+ * Bring the panel rail up and say so. Every driver entry point does this by
+ * itself (epd_bb_init_ctrl()), so this call is not strictly required -- but
+ * doing it here, before the probe or the diagnostics, keeps the log line
+ * honest: it is printed after the pins are actually high and the rail has
+ * settled, not on the strength of a #define.
+ */
+static esp_err_t panel_power_on(void)
+{
+    esp_err_t err = epd_power_init(&k_pins);
+    if (err == ESP_OK) {
+        err = epd_power(true);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "panel power-on failed: %s", esp_err_to_name(err));
+        EPD_TEST_LOG("ERROR stage=power err=%s", esp_err_to_name(err));
+        return err;
+    }
+    EPD_TEST_LOG("pwr gpio%d=1 gpio%d=1", BOARD_EPD_PWR, BOARD_EPD_PWR_AUX);
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     print_boot_banner();
 
+    /* Before anything touches a panel pin: on this board revision GPIO2 gates
+     * the LDO that feeds the panel (board.h). With it low the controller runs
+     * on the leakage current of the signal lines -- enough to answer commands
+     * on BUSY, not enough to latch D/C or a single data byte. */
+    const bool powered = (panel_power_on() == ESP_OK);
+
 #if CONFIG_APP_DIAG_ONLY
     /* Diagnostic build: the panel is never refreshed, only questioned. */
-    if (dc_diag_only() == ESP_OK) {
+    if (powered && diag_only() == ESP_OK) {
         EPD_TEST_LOG("DONE");
     }
 #else
     /* One refresh per boot: the panel is asleep from here on and this firmware
      * never wakes it again. */
-    if (display_bringup() == ESP_OK) {
+    if (powered && display_bringup() == ESP_OK) {
         EPD_TEST_LOG("DONE");
     }
 #endif

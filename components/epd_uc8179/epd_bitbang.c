@@ -12,6 +12,12 @@
  * Write only, deliberately: the panel spec allows nothing else in serial mode
  * (see epd_bitbang.h), so the transcription of DEV_SPI_ReadByte() that used to
  * live here is gone.
+ *
+ * This file also owns the panel power rail (epd_power_init() / epd_power()),
+ * because it is the module every entry point goes through and the rail has to
+ * be up before any pin below is touched. Waveshare's "Loader" firmware for
+ * this board does the same thing in EPD_initSPI(), where PIN_SPI_CS_S (GPIO2)
+ * and PIN_SPI_PWR (GPIO33) go high before any other pin is even configured.
  */
 #include "driver/gpio.h"
 #include "esp_check.h"
@@ -38,6 +44,13 @@ static const char *TAG = "epd";
 #define EPD_RST_HIGH_MS 200
 #define EPD_RST_LOW_MS  5
 
+/* Time given to the panel rail after the enable pin first goes high. The
+ * RT9193 LDO itself is up in well under a millisecond; what this waits for is
+ * the controller behind it, whose power-on reset must complete before the
+ * first byte is clocked in. 200 ms is the same order as the reset pulse above
+ * and is paid exactly once per boot. */
+#define EPD_PWR_SETTLE_MS 200
+
 typedef struct {
     gpio_num_t sck, mosi, cs, dc, rst, busy;
     bool ctrl_ready;   /* rst / dc / busy configured */
@@ -46,9 +59,100 @@ typedef struct {
 
 static epd_bb_ctx_t s_bb;
 
+/* Panel power rail. Separate from s_bb because it outlives every transport:
+ * the pins are configured once and never handed to a peripheral. */
+typedef struct {
+    int  pwr;          /* enable pin, -1 = this board has none */
+    int  pwr_aux;      /* second pin the reference firmware drives, -1 = none */
+    bool configured;   /* epd_power_init() has run */
+    bool ever_on;      /* a power pin has already been taken high once */
+} epd_pwr_ctx_t;
+
+static epd_pwr_ctx_t s_pwr = { .pwr = -1, .pwr_aux = -1 };
+
+/* Diagnostic only: a second pin driven alongside DC, -1 = none. See
+ * epd_bb_set_dc_mirror(). */
+static int s_dc_mirror = -1;
+
+/* One power pin as a plain GPIO output. The output data register is left
+ * alone, so a pin that is already driving high keeps doing so across a
+ * repeated epd_power_init(); on the very first call it holds 0, which is the
+ * rail's off state and the state the panel comes out of reset in anyway. */
+static esp_err_t epd_pwr_config_pin(int gpio)
+{
+    if (gpio < 0) {
+        return ESP_OK;
+    }
+    const gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << gpio),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&cfg);
+}
+
+esp_err_t epd_power_init(const epd_pins_t *pins)
+{
+    ESP_RETURN_ON_FALSE(pins != NULL, ESP_ERR_INVALID_ARG, TAG, "pins is NULL");
+
+    s_pwr.pwr     = pins->pwr;
+    s_pwr.pwr_aux = pins->pwr_aux;
+
+    ESP_RETURN_ON_ERROR(epd_pwr_config_pin(s_pwr.pwr), TAG,
+                        "gpio_config(pwr=%d) failed", s_pwr.pwr);
+    ESP_RETURN_ON_ERROR(epd_pwr_config_pin(s_pwr.pwr_aux), TAG,
+                        "gpio_config(pwr_aux=%d) failed", s_pwr.pwr_aux);
+
+    s_pwr.configured = true;
+    return ESP_OK;
+}
+
+void epd_bb_set_power(int on)
+{
+    if (!s_pwr.configured) {
+        return;
+    }
+    if (s_pwr.pwr >= 0) {
+        gpio_set_level((gpio_num_t)s_pwr.pwr, on != 0);
+    }
+    if (s_pwr.pwr_aux >= 0) {
+        gpio_set_level((gpio_num_t)s_pwr.pwr_aux, on != 0);
+    }
+}
+
+esp_err_t epd_power(bool on)
+{
+    ESP_RETURN_ON_FALSE(s_pwr.configured, ESP_ERR_INVALID_STATE, TAG,
+                        "call epd_power_init() first");
+
+    epd_bb_set_power(on ? 1 : 0);
+
+    /* The settling delay is only owed on the first switch-on: the rail is
+     * never taken down again inside one boot, so the second and later
+     * epd_bb_init_ctrl() calls of the normal flow must not each add 200 ms. */
+    if (on && !s_pwr.ever_on && (s_pwr.pwr >= 0 || s_pwr.pwr_aux >= 0)) {
+        s_pwr.ever_on = true;
+        ESP_LOGI(TAG, "panel power: gpio%d=1 gpio%d=1", s_pwr.pwr, s_pwr.pwr_aux);
+        epd_bus_delay_ms(EPD_PWR_SETTLE_MS);
+    }
+    return ESP_OK;
+}
+
 esp_err_t epd_bb_init_ctrl(const epd_pins_t *pins)
 {
     ESP_RETURN_ON_FALSE(pins != NULL, ESP_ERR_INVALID_ARG, TAG, "pins is NULL");
+
+    /* Power BEFORE anything else. Nothing below means anything on an unpowered
+     * panel, and with the rail off the controller still answers commands on
+     * BUSY through the leakage current of the signal lines -- which is what
+     * made three waves of diagnostics read "the controller does not see D/C". */
+    ESP_RETURN_ON_ERROR(epd_power_init(pins), TAG, "power pins failed");
+    ESP_RETURN_ON_ERROR(epd_power(true), TAG, "panel power-on failed");
+
+    /* A mirror belongs to one diagnostic run; a fresh init never inherits it. */
+    s_dc_mirror = -1;
 
     s_bb.sck  = (gpio_num_t)pins->sck;
     s_bb.mosi = (gpio_num_t)pins->mosi;
@@ -137,6 +241,16 @@ void epd_bb_set_dc(int level)
         return;
     }
     gpio_set_level(s_bb.dc, level != 0);
+    if (s_dc_mirror >= 0) {
+        /* The mirror pin is configured by whoever enabled it; this only
+         * follows the D/C level, on the same side of the byte. */
+        gpio_set_level((gpio_num_t)s_dc_mirror, level != 0);
+    }
+}
+
+void epd_bb_set_dc_mirror(int gpio)
+{
+    s_dc_mirror = gpio;
 }
 
 /* DEV_SPI_WriteByte(): CS low, then for each bit MSB first set MOSI and pulse
