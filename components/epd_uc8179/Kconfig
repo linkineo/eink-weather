@@ -1,0 +1,51 @@
+menu "E-paper UC8179 driver"
+
+    choice EPD_PANEL
+        prompt "E-paper panel"
+        default EPD_PANEL_7IN5B_V2
+        help
+            Selects the command sequences used by the driver. Both panels are
+            800x480 and driven by a UC8179 controller, but they differ in the
+            panel setting (PSR 0x00) and VCOM/data interval (CDI 0x50) values
+            and in how the second data plane (DTM2, 0x13) is interpreted.
+
+        config EPD_PANEL_7IN5B_V2
+            bool "7.5inch (B) V2 800x480 black/white/red"
+            help
+                Waveshare 7.5inch e-Paper (B) V2, three colours.
+                Panel label DKE DEPG0750RWU790F30HP.
+                PSR = 0x0F (BWR OTP LUT), CDI = 0x11 0x07.
+                DTM1 (0x10) carries the black plane, DTM2 (0x13) the red plane.
+
+        config EPD_PANEL_7IN5_V2
+            bool "7.5inch V2 800x480 black/white"
+            help
+                Waveshare 7.5inch e-Paper V2, two colours.
+                PSR = 0x1F (BW OTP LUT), CDI = 0x10 0x07.
+                DTM1 (0x10) carries the image, DTM2 (0x13) its complement.
+                The red argument of epd_display() is ignored.
+
+    endchoice
+
+    config EPD_BUSY_TIMEOUT_MS
+        int "BUSY wait timeout (ms)"
+        default 60000
+        range 1000 300000
+        help
+            Upper bound for every wait on the BUSY_N line. A full refresh of
+            the tri-colour panel takes roughly 15-25 s, so the default leaves
+            a wide margin. On expiry the driver gives up and returns
+            ESP_ERR_TIMEOUT instead of blocking forever.
+
+    config EPD_SPI_HZ
+        int "SPI clock (Hz)"
+        default 4000000
+        range 100000 10000000
+        help
+            Default SPI clock for the panel. Keep it at or below 5 MHz because
+            register reads share the same device: the UC8179 read cycle time
+            tscycr is at least 200 ns (5 MHz), while writes allow a 100 ns
+            cycle (10 MHz). epd_bus_init() overrides this with epd_pins_t.spi_hz
+            when that field is positive.
+
+endmenu
