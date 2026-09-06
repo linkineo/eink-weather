@@ -41,6 +41,16 @@ static epd_bus_ctx_t s_bus;
  * is word aligned so the SPI driver can hand it straight to DMA. */
 static WORD_ALIGNED_ATTR uint8_t s_chunk[EPD_CHUNK_BYTES];
 
+/* Setup time granted to the D/C line inside pre_cb, on top of the delay
+ * epd_bb_set_dc() already applies when the level changes: the peripheral
+ * asserts CS and starts clocking within a few hundred nanoseconds of this
+ * callback returning, which left the SPI path with even less D/C margin than
+ * the bit-bang one. Wave 8 proved that margin is NOT what this panel is
+ * missing (see the header comment of epd_bitbang.c) -- this is kept only
+ * because it is correct and costs nothing. Every transfer here is a polling
+ * transfer, so this runs in task context, never in an ISR. */
+#define EPD_DC_SETUP_US 5
+
 /* Called by the SPI driver just before a transaction starts, i.e. before CS
  * is asserted, so the DC line is already stable when the panel latches the
  * first bit. trans->user carries 0 for a command and 1 for data. Every
@@ -49,6 +59,7 @@ static WORD_ALIGNED_ATTR uint8_t s_chunk[EPD_CHUNK_BYTES];
 static void epd_bus_pre_cb(spi_transaction_t *trans)
 {
     epd_bb_set_dc((int)(intptr_t)trans->user);
+    esp_rom_delay_us(EPD_DC_SETUP_US);
 }
 #endif
 
@@ -119,13 +130,27 @@ esp_err_t epd_bus_init(const epd_pins_t *pins)
      * glass). Reads no longer share this device -- they are bit-banged in
      * epd_bitbang.c before the bus exists -- so nothing here has to care about
      * the bidirectional SDA line any more. */
+    /* cs_ena_pretrans / cs_ena_posttrans hold CS asserted for two extra SCK
+     * cycles before the first edge and after the last one -- 500 ns each at
+     * 4 MHz, against the spec's tcss / tcsh minimum of 100 ns. The default of
+     * 0 gives the controller essentially no CS margin at all, which is one
+     * half of the timing problem the bit-bang header describes; the D/C setup
+     * in pre_cb() is the other. Two is the largest value the ESP32 accepts in
+     * full-duplex mode, and only because no command or address phase is used
+     * here: spi_master.c rejects cs_ena_pretrans > 1 in full duplex when
+     * command_bits or address_bits are non-zero, and spi_hal_iram.c would
+     * silently drop those phases if they were. */
     spi_device_interface_config_t dev_cfg = {
-        .mode           = 0,
-        .clock_speed_hz = hz,
-        .spics_io_num   = pins->cs,
-        .queue_size     = 4,
-        .flags          = 0,
-        .pre_cb         = epd_bus_pre_cb,
+        .mode             = 0,
+        .clock_speed_hz   = hz,
+        .spics_io_num     = pins->cs,
+        .queue_size       = 4,
+        .flags            = 0,
+        .cs_ena_pretrans  = 2,
+        .cs_ena_posttrans = 2,
+        .command_bits     = 0,
+        .address_bits     = 0,
+        .pre_cb           = epd_bus_pre_cb,
     };
 
     esp_err_t err = spi_bus_add_device(EPD_SPI_HOST, &dev_cfg, &s_bus.dev);

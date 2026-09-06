@@ -7,9 +7,10 @@
 #   tools/flash.sh --capture             build + flash + capture until DONE
 #   tools/flash.sh --capture --timeout 30 --expect "flash=4MB"
 #
-# The serial port defaults to /dev/cu.usbserial-110 and can be overridden with
-# the PORT environment variable. Any argument other than --capture is forwarded
-# verbatim to tools/capture.py.
+# The serial port is auto-detected as the first /dev/cu.usbserial* node (the
+# board enumerates as -10 or -110 depending on the USB port used) and can be
+# overridden with the PORT environment variable. Any argument other than
+# --capture is forwarded verbatim to tools/capture.py.
 
 set -euo pipefail
 
@@ -33,6 +34,9 @@ set +eu
 source tools/env.sh
 set -eu
 
+# First matching node, deterministic when several boards are attached; the
+# same rule as tools/capture.py's detect_port().
+PORT="${PORT:-$(ls -1 /dev/cu.usbserial* 2>/dev/null | head -n 1)}"
 PORT="${PORT:-/dev/cu.usbserial-110}"
 
 echo "flash.sh: building and flashing on $PORT"

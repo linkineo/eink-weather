@@ -130,6 +130,25 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
    the right one and the board-side RST path is electrically intact. Software is exhausted:
    Waveshare's Loader (same pins, same bit-bang, same init) is the last arbiter to re-run.
    The board now enumerates as `/dev/cu.usbserial-10` (USB port changed).
+7. **Run 7 — arbitration with Waveshare's own code** (`arduino-cli` 1.5.1 + esp32 core 3.3.11,
+   unmodified `esp32-waveshare-epd` library, example `epd7in5b_V2-demo`, sources kept in the
+   session scratchpad `arduino_ref/`): `EPD_7IN5B_V2_Clear()` gave a clean **white** screen → data
+   bytes DO reach the RAM on this board+panel with Arduino-speed bit-banging. The demo's next step
+   (`Init_Fast` + demo image) produced noise and BUSY never released (> 76 s) — the fast mode is
+   not usable on this panel batch; we only use the normal init. Root cause of our failures:
+   **D/C (and CS) setup time**. Our transports raised D/C and started clocking ~100–200 ns later
+   (`gpio_set_level` ≈ 60 ns, `cs_ena_pretrans` = 0), Arduino's `digitalWrite` gives ≈ 0.4 µs per
+   call; the controller latched the previous D/C level, so every data byte was a command. Fix:
+   explicit setup/hold delays in both transports (run 8).
+8. **Run 8** — setup/hold margins added (D/C 5 µs then 50 µs, CS 2/2 then 10/10 µs, SPI
+   `cs_ena_pretrans/posttrans` = 2): `DC_NOT_SEEN` unchanged, a lone data byte 0x04 still powers the
+   panel on. Timing is NOT the difference. Re-reading run 7: Waveshare's Clear stream is 0xFF (no
+   such command) and 0x00 (PSR without parameter) — harmless as commands — so the white screen was
+   the panel RAM's power-on content after the user had unplugged the board, not written data; and
+   `Init_Fast` contains 0xE0 **0x02** which, read as a command, powers the panel off → the hang.
+   Confirmed by running the vendor demo with only the normal-mode drawing block: the refresh
+   started at +20.6 s and BUSY never released in 150 s. **Vendor code fails identically → the D/C
+   line is open on this board/panel pair today**, whatever worked in the past.
 
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a

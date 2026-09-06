@@ -66,8 +66,11 @@ idf.py build
 tools/flash.sh --capture     # build, flash and verify the UART output
 ```
 
-The default serial port is `/dev/cu.usbserial-110`; override it with
-`PORT=/dev/cu.xxx tools/flash.sh`.
+The serial port is auto-detected as the first `/dev/cu.usbserial*` device node
+(the board enumerates as `-10` or `-110` depending on which USB port it is
+plugged into), by both `tools/flash.sh` and `tools/capture.py`. Override it with
+`PORT=/dev/cu.xxx tools/flash.sh` or `capture.py --port /dev/cu.xxx`; the port
+actually used is printed in the `[capture]` line.
 
 ### Data path and the bit-bang fallback
 
@@ -135,6 +138,31 @@ tools/flash.sh --capture --timeout 40 --expect "dctest"
 Switch back with the reverse `sed` (`CONFIG_APP_DIAG_ONLY=y` →
 `# CONFIG_APP_DIAG_ONLY is not set`) — or `idf.py menuconfig`, menu
 "eink-weather bring-up".
+
+## Bring-up notes
+
+**D/C setup time: tried, and ruled out.** Waveshare's own unmodified Arduino
+demo (`epd7in5b_V2-demo`) was flashed on this exact board and panel and cleared
+the screen to a clean white, so its *data* bytes reach the controller's RAM;
+this firmware, with the same pins and the same command sequence, has only ever
+produced noise, and every oracle in `epd_diag.c` reports that the controller
+read D/C as low for the data bytes. The one visible difference was timing —
+Arduino's `digitalWrite()` costs 300–400 ns per call, `gpio_set_level()` 50–80
+ns, so both of our transports raised D/C and began clocking roughly 200 ns
+later, where the demo would have taken close to a microsecond — which would
+make the controller latch the stale D/C level (0, command) for every data byte
+and explain all seven earlier runs. So generous margins were added to both
+transports: `EPD_BB_DC_SETUP_US` / `EPD_BB_CS_SETUP_US` / `EPD_BB_CS_HOLD_US`
+in `epd_bitbang.c`, and a 5 µs delay in the SPI `pre_cb` plus
+`cs_ena_pretrans` / `cs_ena_posttrans = 2` (500 ns each at 4 MHz) in
+`epd_bus.c`. They did not help: the diagnostic still returns `DC_NOT_SEEN`,
+and so does a run at 50 µs of D/C setup and 10 µs of CS setup/hold — 2500× the
+spec's `tcds` of 20 ns — in which a lone `0x04` clocked out with D/C **high**
+and no command before it still executed as a power-on (BUSY low at 0 ms, high
+at 131 ms, the full PON signature rather than the 41 ms POF pulse). Setup time
+is therefore not the difference, the margins are kept only because they are
+correct and essentially free, and what separates this firmware from the
+Arduino demo is still unknown.
 
 ## Repository layout
 

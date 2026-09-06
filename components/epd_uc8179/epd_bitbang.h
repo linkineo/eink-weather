@@ -66,7 +66,10 @@ bool epd_bb_ctrl_ready(void);
  * epd_bb_release() not called since). */
 bool epd_bb_data_ready(void);
 
-/* Drive the DC line directly: 0 = command, 1 = data. */
+/* Drive the DC line directly: 0 = command, 1 = data. A level change is
+ * followed by EPD_BB_DC_SETUP_US of settling time before the function returns,
+ * so the caller may open the CS window immediately afterwards; a call that
+ * asks for the level already driven costs nothing. */
 void epd_bb_set_dc(int level);
 
 /* Diagnostic hook: mirror every D/C level change onto a second GPIO, so that

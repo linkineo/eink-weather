@@ -3,11 +3,40 @@
  * e-Paper ESP32 Driver Board demo (DEV_Config.cpp, V1.0 2020-02-19):
  * GPIO_Config() and DEV_SPI_WriteByte().
  *
- * The only deliberate difference is an explicit 1 us delay after each clock
- * edge. Arduino's digitalWrite() is slow enough that the reference needs no
- * delay; gpio_set_level() is not, so without one the clock would run far
- * above the controller's limits. 1 us per edge puts SCL at roughly 300-500
- * kHz, comfortably inside the UC8179's write cycle (tscycw >= 100 ns).
+ * The deliberate differences from the reference are all delays, and they exist
+ * for the same reason: Arduino's digitalWrite() costs 300-400 ns per call,
+ * gpio_set_level() 50-80 ns, so a literal transcription runs roughly five
+ * times faster than the code that is known to drive this panel.
+ *
+ *  - EPD_BB_EDGE_US after each clock edge. Without it the clock would run far
+ *    above the controller's limits; 1 us per edge puts SCL at roughly 300-500
+ *    kHz, comfortably inside the UC8179's write cycle (tscycw >= 100 ns).
+ *
+ *  - EPD_BB_DC_SETUP_US after the D/C line changes level, and
+ *    EPD_BB_CS_SETUP_US / EPD_BB_CS_HOLD_US around the CS window.
+ *
+ *    Those three came out of the wave-8 hypothesis, which they then refuted;
+ *    they are kept because they are correct and free, not because they fixed
+ *    anything. The hypothesis: Waveshare's own unmodified Arduino demo
+ *    (epd7in5b_V2-demo -- same pins, same command sequence, same bit-banged
+ *    transport) clears this exact board and panel to a clean WHITE screen, so
+ *    its DATA bytes reach the controller's RAM, while this firmware, with an
+ *    identical command sequence, always produced random noise and every D/C
+ *    oracle in epd_diag.c reported that the controller had seen D/C LOW for
+ *    the data bytes. The one difference was timing: this transport raised D/C
+ *    and pulled CS low roughly 100 ns later, where digitalWrite() would have
+ *    taken ~400 ns per call. If the controller sampled D/C with less margin
+ *    than that, it would latch the OLD level -- 0, command -- for every data
+ *    byte, and all seven earlier runs would follow.
+ *
+ *    It does not. With the values below the diagnostic still returned
+ *    DC_NOT_SEEN, and so did a run at 50 us of D/C setup and 10 us of CS
+ *    setup/hold -- 2500 times the spec's tcds of 20 ns, and 100 times its
+ *    tcss/tcsh of 100 ns. In that run a LONE 0x04 clocked out with D/C high
+ *    and nothing before it still executed as PON (BUSY low 0 ms, high 131 ms:
+ *    a full power-on, not the 41 ms POF pulse this controller also emits). So
+ *    D/C setup time is not what separates this firmware from the Arduino demo,
+ *    and whatever does is still unidentified.
  *
  * Write only, deliberately: the panel spec allows nothing else in serial mode
  * (see epd_bitbang.h), so the transcription of DEV_SPI_ReadByte() that used to
@@ -32,6 +61,20 @@ static const char *TAG = "epd";
 /* Half period of the bit-banged clock, in microseconds. */
 #define EPD_BB_EDGE_US 1
 
+/* Setup time granted to the D/C line after it changes level, before the CS
+ * window that carries the byte it qualifies opens. 250 times the spec's tcds
+ * of 20 ns, and paid once per command and once per plane rather than once per
+ * byte, so its cost is unmeasurable. */
+#define EPD_BB_DC_SETUP_US 5
+
+/* Margins around the CS window: time between CS falling and the first rising
+ * clock edge (spec tcss >= 100 ns), and between the last falling clock edge
+ * and CS rising (spec tcsh >= 100 ns). Paid per byte, which is why they are
+ * smaller than the D/C setup -- 4 us on top of a ~20 us byte, i.e. about 200 ms
+ * on a 48000-byte plane, against a 15-25 s refresh. */
+#define EPD_BB_CS_SETUP_US 2
+#define EPD_BB_CS_HOLD_US  2
+
 /* Reset pulse timing, transcribed from the tri-colour Raspberry Pi reference
  * driver EPD_7in5b_V2.c:40-48 (EPD_Reset): DEV_Delay_ms(200) / 5 / 200.
  * The Waveshare references disagree with each other -- the black/white driver
@@ -55,6 +98,7 @@ typedef struct {
     gpio_num_t sck, mosi, cs, dc, rst, busy;
     bool ctrl_ready;   /* rst / dc / busy configured */
     bool data_ready;   /* sck / mosi / cs owned by this module */
+    int  dc_level;     /* last level driven on D/C, -1 = unknown */
 } epd_bb_ctx_t;
 
 static epd_bb_ctx_t s_bb;
@@ -171,6 +215,10 @@ esp_err_t epd_bb_init_ctrl(const epd_pins_t *pins)
     ESP_RETURN_ON_ERROR(gpio_config(&out_cfg), TAG, "gpio_config(rst/dc) failed");
     ESP_RETURN_ON_ERROR(gpio_set_level(s_bb.rst, 1), TAG, "rst high failed");
     ESP_RETURN_ON_ERROR(gpio_set_level(s_bb.dc, 0), TAG, "dc low failed");
+    /* "Unknown" rather than 0: the very next epd_bb_set_dc() then pays the
+     * setup delay whatever it asks for, instead of trusting a level this
+     * function drove before the pin was even in its final configuration. */
+    s_bb.dc_level = -1;
 
     /* BUSY_N is an input with the internal pull-down enabled: with no panel
      * attached the pin then reads 0 deterministically instead of floating.
@@ -240,11 +288,23 @@ void epd_bb_set_dc(int level)
     if (!s_bb.ctrl_ready) {
         return;
     }
-    gpio_set_level(s_bb.dc, level != 0);
+
+    const int want = (level != 0) ? 1 : 0;
+    const bool changed = (s_bb.dc_level != want);
+
+    gpio_set_level(s_bb.dc, want);
     if (s_dc_mirror >= 0) {
         /* The mirror pin is configured by whoever enabled it; this only
          * follows the D/C level, on the same side of the byte. */
-        gpio_set_level((gpio_num_t)s_dc_mirror, level != 0);
+        gpio_set_level((gpio_num_t)s_dc_mirror, want);
+    }
+    s_bb.dc_level = want;
+
+    /* Setup time, and only when the line really moved: a plane is 48000 calls
+     * to epd_bb_data()'s inner loop with D/C already high, and paying 5 us on
+     * each of those would add four minutes to a refresh for nothing. */
+    if (changed) {
+        esp_rom_delay_us(EPD_BB_DC_SETUP_US);
     }
 }
 
@@ -253,10 +313,25 @@ void epd_bb_set_dc_mirror(int gpio)
     s_dc_mirror = gpio;
 }
 
+/* Open the CS window: CS low, then tcss of setup before any clock edge.
+ * Factored out with its closing counterpart so the 8-bit and the 9-bit writer
+ * below stay bit-for-bit identical in timing. */
+static inline void epd_bb_cs_assert(void)
+{
+    gpio_set_level(s_bb.cs, 0);
+    esp_rom_delay_us(EPD_BB_CS_SETUP_US);
+}
+
+/* Close it: tcsh of hold after the last falling clock edge, then CS high. */
+static inline void epd_bb_cs_release(void)
+{
+    esp_rom_delay_us(EPD_BB_CS_HOLD_US);
+    gpio_set_level(s_bb.cs, 1);
+}
+
 /* One bit out on MOSI, clocked in by the controller on the rising edge of SCL
- * (spec 3.3-2-2, Table 3-2). The two delays are the only deliberate difference
- * from DEV_SPI_WriteByte(); factoring them out here is what keeps the 8-bit
- * and the 9-bit writer below bit-for-bit identical in timing. */
+ * (spec 3.3-2-2, Table 3-2). The two delays are a deliberate difference from
+ * DEV_SPI_WriteByte(); see the file header. */
 static inline void epd_bb_clock_bit(int bit)
 {
     gpio_set_level(s_bb.mosi, bit ? 1 : 0);
@@ -273,12 +348,12 @@ void epd_bb_write_byte(uint8_t b)
     if (!s_bb.data_ready) {
         return;
     }
-    gpio_set_level(s_bb.cs, 0);
+    epd_bb_cs_assert();
     for (int i = 0; i < 8; i++) {
         epd_bb_clock_bit(b & 0x80u);
         b = (uint8_t)(b << 1);
     }
-    gpio_set_level(s_bb.cs, 1);
+    epd_bb_cs_release();
 }
 
 /* One 9-bit frame: the byte plus its D/C bit, inside a single CS window.
@@ -297,7 +372,7 @@ void epd_bb_write_frame9(int dc_bit, uint8_t b, bool dc_first)
     if (!s_bb.data_ready) {
         return;
     }
-    gpio_set_level(s_bb.cs, 0);
+    epd_bb_cs_assert();
     if (dc_first) {
         epd_bb_clock_bit(dc_bit != 0);
     }
@@ -308,7 +383,7 @@ void epd_bb_write_frame9(int dc_bit, uint8_t b, bool dc_first)
     if (!dc_first) {
         epd_bb_clock_bit(dc_bit != 0);
     }
-    gpio_set_level(s_bb.cs, 1);
+    epd_bb_cs_release();
 }
 
 void epd_bb_cmd(uint8_t cmd)

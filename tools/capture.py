@@ -19,6 +19,7 @@ Exit codes:
 """
 
 import argparse
+import glob
 import sys
 import time
 
@@ -33,7 +34,23 @@ except ImportError:
     )
     sys.exit(3)
 
-DEFAULT_PORT = "/dev/cu.usbserial-110"
+FALLBACK_PORT = "/dev/cu.usbserial-110"
+
+
+def detect_port():
+    """First CP2102N style device node, or FALLBACK_PORT if none is present.
+
+    The Waveshare driver board enumerates as /dev/cu.usbserial-<n>, where <n>
+    depends on the USB port it happens to be plugged into (it has been -110 and
+    -10 on this Mac), so hard-coding one node breaks every time the cable moves.
+    Sorted for a deterministic choice when several boards are attached; --port
+    overrides it, and the port actually used is printed in the [capture] line.
+    """
+    ports = sorted(glob.glob("/dev/cu.usbserial*"))
+    return ports[0] if ports else FALLBACK_PORT
+
+
+DEFAULT_PORT = detect_port()
 DEFAULT_BAUD = 115200
 DEFAULT_TIMEOUT = 90.0
 DEFAULT_UNTIL = "[EPD-TEST] DONE"
