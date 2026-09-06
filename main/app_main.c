@@ -7,11 +7,11 @@
  * ONE panel refresh per boot (Waveshare rule: never leave the panel powered,
  * keep refreshes rare), then a heartbeat every 10 s forever.
  *
- * CONFIG_APP_DIAG_ONLY replaces the display bring-up with the electrical
- * diagnostics of components/epd_uc8179/epd_diag.c -- epd_dc_diag(),
- * epd_rst_diag(), epd_dcscan() -- and nothing else: no bus, no epd_init(), no
- * image, no refresh. That build exists to answer electrical questions about
- * the panel connector and is safe to run as often as needed; the display
+ * CONFIG_APP_DIAG_ONLY replaces the display bring-up with the diagnostics of
+ * components/epd_uc8179/epd_diag.c -- epd_dc_diag(), epd_wire_diag(),
+ * epd_rst_diag() -- and nothing else: no bus, no epd_init(), no image, no
+ * refresh. That build exists to answer questions about the panel connector and
+ * about the bus framing, and is safe to run as often as needed; the display
  * build is not.
  *
  * All machine-readable output follows the log contract in test_log.h, and
@@ -413,18 +413,28 @@ static esp_err_t display_bringup(void)
  *===========================================================================*/
 
 /*
- * Runs the three electrical diagnostics in order and prints one line each:
+ * Runs the electrical diagnostics in order and prints one line each:
  *
  *   dctest   does the controller see the D/C line at all?
+ *   wiretest is there a D/C line to see? 3-wire mode carries the D/C bit
+ *            inside a 9-bit frame and grounds the pin, which reproduces every
+ *            observation dctest has ever made without a single broken contact.
+ *            Runs straight after dctest because it can retire that whole
+ *            question -- or confirm it -- in eight seconds.
  *   rsttest  does the hardware reset pulse reach the controller? (RST and D/C
  *            are adjacent contacts on the panel FPC: whether both are dead
  *            decides between a mechanical fault and a single broken line)
- *   dcscan   is D/C wired to a different GPIO on this board revision?
+ *
+ * epd_dcscan() is deliberately NOT in this list any more: it swept every free
+ * GPIO for a mirrored D/C line in three separate runs and found none, it costs
+ * seven seconds, and it is meaningless under the 3-wire hypothesis (there is
+ * no D/C line to find). The function stays in the driver; add the call back
+ * here if a board revision ever needs the sweep again.
  *
  * Deliberately the whole of what this build does to the panel: no
- * epd_bus_init(), no epd_init(), no epd_display(), no refresh. Each of the
- * three leaves the panel powered off and reset, so the sequence may be
- * repeated as often as the investigation needs.
+ * epd_bus_init(), no epd_init(), no epd_display(), no refresh. Each diagnostic
+ * leaves the panel powered off and reset, so the sequence may be repeated as
+ * often as the investigation needs.
  */
 static esp_err_t diag_only(void)
 {
@@ -440,6 +450,16 @@ static esp_err_t diag_only(void)
     epd_dc_diag_format(&diag, line, sizeof(line));
     EPD_TEST_LOG("%s", line);
 
+    epd_wire_diag_result_t wire;
+    err = epd_wire_diag(&k_pins, &wire);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "epd_wire_diag() failed: %s", esp_err_to_name(err));
+        EPD_TEST_LOG("ERROR stage=wirediag err=%s", esp_err_to_name(err));
+        return err;
+    }
+    epd_wire_diag_format(&wire, line, sizeof(line));
+    EPD_TEST_LOG("%s", line);
+
     epd_rst_diag_result_t rst;
     err = epd_rst_diag(&k_pins, &rst);
     if (err != ESP_OK) {
@@ -448,16 +468,6 @@ static esp_err_t diag_only(void)
         return err;
     }
     epd_rst_diag_format(&rst, line, sizeof(line));
-    EPD_TEST_LOG("%s", line);
-
-    epd_dcscan_result_t scan;
-    err = epd_dcscan(&k_pins, &scan);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "epd_dcscan() failed: %s", esp_err_to_name(err));
-        EPD_TEST_LOG("ERROR stage=dcscan err=%s", esp_err_to_name(err));
-        return err;
-    }
-    epd_dcscan_format(&scan, line, sizeof(line));
     EPD_TEST_LOG("%s", line);
 
     return ESP_OK;

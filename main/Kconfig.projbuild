@@ -5,8 +5,8 @@ menu "eink-weather bring-up"
         default n
         help
             Electrical diagnostic mode. app_main() prints the boot banner, runs
-            epd_dc_diag(), epd_rst_diag() and epd_dcscan() over bit-banged GPIO
-            and stops: no epd_init(), no epd_display(), no refresh, ever. The
+            epd_dc_diag(), epd_wire_diag() and epd_rst_diag() over bit-banged
+            GPIO and stops: no epd_init(), no epd_display(), no refresh. The
             panel is left powered off (POF) and in its post-reset idle state,
             so the mode is safe to repeat as often as needed -- unlike a
             refresh, which ages the glass and must stay rare.
@@ -23,12 +23,20 @@ menu "eink-weather bring-up"
             command and sometimes as a data byte and watches whether the
             controller powers up. See components/epd_uc8179/epd_diag.c.
 
-            The other two narrow down the answer. epd_rst_diag() asks whether
-            the hardware reset pulse reaches the controller at all -- RST and
-            D/C are adjacent contacts on the panel FPC, so two dead lines mean
-            a mechanical fault where one dead line does not -- by timing the
+            The other two narrow down the answer. epd_wire_diag() asks whether
+            there is a D/C line to see at all: in 3-wire mode the pin is tied
+            to ground and the D/C bit travels as the first of nine bits in each
+            frame, so an 8-bit frame reads as a command whatever the pin does
+            -- exactly what has been observed. It sends 9-bit frames and reads
+            the same BUSY oracle. epd_rst_diag() asks whether the hardware
+            reset pulse reaches the controller at all -- RST and D/C are
+            adjacent contacts on the panel FPC, so two dead lines mean a
+            mechanical fault where one dead line does not -- by timing the
             BUSY_N low pulse that POF produces with and without a reset in
-            between. epd_dcscan() drives each free GPIO as a second D/C line
-            in turn, to exclude a board revision that wires D/C elsewhere.
+            between.
+
+            epd_dcscan(), which drives each free GPIO as a second D/C line to
+            exclude a board revision that wires D/C elsewhere, is still in the
+            driver but no longer called: three runs found no such pin.
 
 endmenu

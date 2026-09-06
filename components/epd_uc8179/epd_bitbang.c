@@ -253,6 +253,19 @@ void epd_bb_set_dc_mirror(int gpio)
     s_dc_mirror = gpio;
 }
 
+/* One bit out on MOSI, clocked in by the controller on the rising edge of SCL
+ * (spec 3.3-2-2, Table 3-2). The two delays are the only deliberate difference
+ * from DEV_SPI_WriteByte(); factoring them out here is what keeps the 8-bit
+ * and the 9-bit writer below bit-for-bit identical in timing. */
+static inline void epd_bb_clock_bit(int bit)
+{
+    gpio_set_level(s_bb.mosi, bit ? 1 : 0);
+    gpio_set_level(s_bb.sck, 1);
+    esp_rom_delay_us(EPD_BB_EDGE_US);
+    gpio_set_level(s_bb.sck, 0);
+    esp_rom_delay_us(EPD_BB_EDGE_US);
+}
+
 /* DEV_SPI_WriteByte(): CS low, then for each bit MSB first set MOSI and pulse
  * SCK high/low, then CS high. */
 void epd_bb_write_byte(uint8_t b)
@@ -262,12 +275,38 @@ void epd_bb_write_byte(uint8_t b)
     }
     gpio_set_level(s_bb.cs, 0);
     for (int i = 0; i < 8; i++) {
-        gpio_set_level(s_bb.mosi, (b & 0x80u) ? 1 : 0);
+        epd_bb_clock_bit(b & 0x80u);
         b = (uint8_t)(b << 1);
-        gpio_set_level(s_bb.sck, 1);
-        esp_rom_delay_us(EPD_BB_EDGE_US);
-        gpio_set_level(s_bb.sck, 0);
-        esp_rom_delay_us(EPD_BB_EDGE_US);
+    }
+    gpio_set_level(s_bb.cs, 1);
+}
+
+/* One 9-bit frame: the byte plus its D/C bit, inside a single CS window.
+ *
+ * The spec's 3-wire order (3.3-2-3) is "DC bit, D7 to D0 bit", i.e.
+ * dc_first = true; dc_first = false clocks the byte out first and the D/C bit
+ * last, which is the other convention a controller could plausibly use and
+ * which epd_wire_diag() has to rule out rather than assume.
+ *
+ * The physical D/C pin is deliberately NOT touched: in 3-wire mode it is not a
+ * bus signal at all ("The pin DC can be connected to an external ground"), and
+ * leaving it low is exactly the tie-low the spec's Table 7-3 asks for. Callers
+ * that care set it low once before the first frame. */
+void epd_bb_write_frame9(int dc_bit, uint8_t b, bool dc_first)
+{
+    if (!s_bb.data_ready) {
+        return;
+    }
+    gpio_set_level(s_bb.cs, 0);
+    if (dc_first) {
+        epd_bb_clock_bit(dc_bit != 0);
+    }
+    for (int i = 0; i < 8; i++) {
+        epd_bb_clock_bit(b & 0x80u);
+        b = (uint8_t)(b << 1);
+    }
+    if (!dc_first) {
+        epd_bb_clock_bit(dc_bit != 0);
     }
     gpio_set_level(s_bb.cs, 1);
 }

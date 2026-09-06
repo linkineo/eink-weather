@@ -81,6 +81,16 @@ void epd_bb_set_dc_mirror(int gpio);
  * (DEV_Config.cpp DEV_SPI_WriteByte()). DC is *not* touched. */
 void epd_bb_write_byte(uint8_t b);
 
+/* One 9-bit frame out inside a single CS window, same clock timing as
+ * epd_bb_write_byte(): the D/C bit plus the eight data bits MSB first, in the
+ * 3-wire order "DC bit, D7 to D0 bit" when dc_first is true, and byte-then-D/C
+ * when it is false. The physical DC pin is *not* touched -- 3-wire mode does
+ * not use it and the spec has it tied low. Only epd_wire_diag() needs this:
+ * it is how the diagnostic asks whether this controller is strapped into
+ * 3-wire mode, where the D/C pin is ignored and every frame carries its own
+ * D/C bit. */
+void epd_bb_write_frame9(int dc_bit, uint8_t b, bool dc_first);
+
 /* One command byte: DC low, then the byte. */
 void epd_bb_cmd(uint8_t cmd);
 

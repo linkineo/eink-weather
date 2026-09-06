@@ -68,6 +68,21 @@
  *                   controller's D/C input keeps the CDI parameter a
  *                   parameter, so the panel stays off: pon=no identifies it.
  *
+ *   epd_wire_diag() Is the controller in 3-wire mode, where there IS no D/C
+ *                   signal? This is the one explanation that no D/C experiment
+ *                   above can reach, because all of them assume 8-bit frames.
+ *                   The panel spec (3.3-2-3) describes the alternative: with
+ *                   the bus-select strap in the other position the D/C pin is
+ *                   tied to ground and "there are altogether 9-bits [...]
+ *                   shifted into the shift register on every ninth clock in
+ *                   sequence: DC bit, D7 to D0 bit". A controller in that mode
+ *                   whose shift register clears when CSB falls and latches
+ *                   when it rises reads every 8-bit frame this firmware has
+ *                   ever sent as [DC = 0][byte] -- a COMMAND, whatever the D/C
+ *                   pin does. That reproduces all five hardware runs exactly,
+ *                   with no broken contact anywhere. So the oracles send 9-bit
+ *                   frames and watch the same BUSY signature.
+ *
  * Nothing here refreshes the panel: no DRF, no DTM1/DTM2, no image data. Every
  * oracle that may have powered the analogue rails is followed by POF and a
  * hardware reset, so the panel ends idle with the booster off.
@@ -100,6 +115,7 @@ static const char *TAG = "epd";
 #define UC8179_PON   0x04   /* Power on */
 #define UC8179_DSLP  0x07   /* Deep sleep (needs the 0xA5 check byte as DATA) */
 #define UC8179_CDI   0x50   /* VCOM and data interval setting */
+#define UC8179_DSLP_CHECK 0xA5   /* the check byte DSLP only arms for, as DATA */
 
 /* Length of one PON signature watch. Power-on took 34-131 ms in every
  * hardware run so far, so 400 ms of 1 ms samples is a wide margin while
@@ -396,7 +412,7 @@ esp_err_t epd_dc_diag(const epd_pins_t *pins, epd_dc_diag_result_t *out)
      * controller is asleep and ignores the PON that follows (pon=no). If it
      * did not, PON runs (pon=yes). Either way the power-down's reset pulse
      * wakes the controller again. */
-    static const uint8_t k_dslp_check = 0xA5;
+    static const uint8_t k_dslp_check = UC8179_DSLP_CHECK;
     epd_bb_cmd(UC8179_DSLP);
     epd_bb_data(&k_dslp_check, 1);
     epd_bus_delay_ms(EPD_DIAG_DSLP_SETTLE_MS);
@@ -816,4 +832,279 @@ void epd_dcscan_format(const epd_dcscan_result_t *r, char *buf, size_t len)
     } else {
         snprintf(buf, len, "dcscan candidates=%s found=none", cands);
     }
+}
+
+/*=================================================== 3-wire / 4-wire test ==*/
+
+/*
+ * Five oracles, all reading the same BUSY power-on signature, that together
+ * name the framing the controller actually decodes. What each frame decodes to
+ * under the three hypotheses (the 4-wire column is the first EIGHT clocks,
+ * since a 4-wire controller latches there and drops the ninth bit; the D/C pin
+ * is held low throughout, so a 4-wire controller sees every frame as a
+ * command):
+ *
+ *   frame                 3-wire D/C-first   3-wire D/C-last   4-wire (8 bits)
+ *   --------------------  -----------------  ----------------  ---------------
+ *   8-bit 0x04            PON                0x02 = POF        PON
+ *   [0][0x04] D/C first   PON                0x02 = POF (*)    0x02 = POF
+ *   [0x04][0] D/C last    0x02 = PON... (**) PON               PON
+ *
+ *   (*)  DC = the last bit = 0, byte = the first eight bits = 0000 0010.
+ *   (**) DC = the first bit = 0, byte = 0000 0100 = PON as well.
+ *
+ * so:
+ *
+ *   F1  control, the 8-bit PON of oracle D. Expected yes; a no means the
+ *       detector is broken and nothing below may be read.
+ *   F2  [0][0x04] D/C first. The discriminator: only a 3-wire controller
+ *       reading D/C first powers ON here. Both other hypotheses run POF
+ *       instead -- and POF on THIS controller still pulses BUSY_N low for
+ *       ~41 ms whether the rails are up or not (rsttest, six runs), so the
+ *       bare low-then-high signature would read "yes" for a power-OFF. That is
+ *       why every oracle below is scored on the RELEASE TIME as well: PON
+ *       releases BUSY at ~131 ms, POF at ~41 ms, and epd_wire_powered_on()
+ *       turns the pair into the "did the panel power on?" that each oracle is
+ *       really asking. Both numbers reach the log.
+ *   F3  the same, one level deeper: DSLP as a D/C-first COMMAND frame then
+ *       0xA5 as a D/C-first DATA frame, which only a 3-wire/D/C-first
+ *       controller can put together into an armed deep sleep. The 8-bit PON
+ *       that follows is then ignored (no); under every other hypothesis it
+ *       runs (yes). F3 is what turns F2's "something ran" into proof that a
+ *       9-bit DATA frame reached the RAM path.
+ *   F4  [0x04][0] D/C last. Powers on under two hypotheses out of three, so it
+ *       is meaningless alone and exists only to give F5 its control.
+ *   F5  F3's question for the D/C-last order.
+ *
+ * Nothing here refreshes the panel, and every oracle is closed by
+ * epd_wire_power_down() -- a power-off sent in all three framings, then a
+ * reset pulse -- so the panel cannot be left powered by a hypothesis that
+ * turns out to be wrong.
+ */
+
+/* How long BUSY_N must stay low for the signature to be a power-ON rather than
+ * the pulse POF produces. The two are not close on this hardware: PON has
+ * released BUSY at 131 ms and POF at 41 ms in every run of every wave, so 80 ms
+ * sits in the middle of a gap a factor of three wide. The raw signature and the
+ * measured time are both kept and both printed, so a run in which that gap ever
+ * narrows says so in its own log instead of quietly changing the verdict. */
+#define EPD_WIRE_PON_MIN_MS 80
+
+/* Did the panel actually power on? -- the question every oracle is asking, as
+ * opposed to "did any command run?", which is all epd_pon_watch_t::pon can say
+ * on a controller whose POF pulses BUSY too. */
+static bool epd_wire_powered_on(const epd_pon_watch_t *w)
+{
+    return w->pon && (w->high_ms - w->low_ms) >= EPD_WIRE_PON_MIN_MS;
+}
+
+/* One oracle's watch, logged under its own name and scored into
+ * out->powered[which]. */
+static void epd_wire_watch(const char *name, epd_wire_diag_result_t *out,
+                           epd_wire_oracle_t which)
+{
+    epd_pon_watch_t *w = &out->watch[which];
+    char what[48];
+
+    snprintf(what, sizeof(what), "wiretest %s", name);
+    epd_diag_watch_for(what, EPD_DIAG_WATCH_MS, w);
+    out->powered[which] = epd_wire_powered_on(w);
+
+    if (w->pon && !out->powered[which]) {
+        ESP_LOGW(TAG, "%s: BUSY_N was low for only %d ms -- that is the shape of "
+                      "the POF pulse (~41 ms), not of a power-on (~131 ms), so "
+                      "this counts as 'a command ran', NOT as 'the panel powered "
+                      "on'", what, w->high_ms - w->low_ms);
+    }
+}
+
+/*
+ * Close one oracle. POF is sent in all THREE framings, because the question
+ * this diagnostic asks is precisely "which framing does the controller
+ * understand?" -- and the answer must not decide whether the panel is left at
+ * high voltage, which damages it irreversibly. What each closing frame decodes
+ * to, in the order they are sent:
+ *
+ *   [0x02][0] D/C last    D/C-last: POF     D/C-first: 0x04 = PON (!)   4-wire: POF
+ *   [0][0x02] D/C first   D/C-last: 0x01    D/C-first: POF              4-wire: 0x00
+ *   8-bit 0x02            D/C-last: 0x01    D/C-first: POF              4-wire: POF
+ *
+ * The panel therefore ends up unpowered under every hypothesis: D/C-last is
+ * switched off by the first frame, D/C-first by the second and third (the
+ * transient power-on the first frame causes there is cancelled some tens of
+ * microseconds later, long before the booster is up), 4-wire by the first and
+ * the third. The stray PWR (0x01) and PSR (0x00) commands are left waiting for
+ * parameters that never come, and the reset pulse clears them.
+ */
+static void epd_wire_power_down(const char *name)
+{
+    char what[48];
+    snprintf(what, sizeof(what), "wiretest %s", name);
+
+    epd_bb_set_dc(0);
+    epd_bb_write_frame9(0, UC8179_POF, false);   /* [0x02][0], D/C last  */
+    epd_bb_write_frame9(0, UC8179_POF, true);    /* [0][0x02], D/C first */
+    epd_bb_cmd(UC8179_POF);                      /* the plain 8-bit form */
+
+    int ms = 0;
+    if (epd_bus_wait_busy_high(EPD_DIAG_POF_TIMEOUT_MS, &ms) == ESP_OK) {
+        ESP_LOGI(TAG, "%s: power-off in all 3 framings, BUSY released after %d ms",
+                 what, ms);
+    } else {
+        ESP_LOGW(TAG, "%s: power-off wait gave up after %d ms", what, ms);
+    }
+
+    /* Also the next oracle's opening reset: each one is self-contained, so no
+     * stray ninth bit and no half-shifted frame can survive into it. */
+    epd_bb_reset_pulse();
+}
+
+static void epd_wire_set_verdict(epd_wire_diag_result_t *r, const char *verdict)
+{
+    snprintf(r->verdict, sizeof(r->verdict), "%s", verdict);
+}
+
+esp_err_t epd_wire_diag(const epd_pins_t *pins, epd_wire_diag_result_t *out)
+{
+    ESP_RETURN_ON_FALSE(pins != NULL, ESP_ERR_INVALID_ARG, TAG, "pins is NULL");
+    ESP_RETURN_ON_FALSE(out != NULL, ESP_ERR_INVALID_ARG, TAG, "out is NULL");
+    ESP_RETURN_ON_FALSE(!epd_bus_ready(), ESP_ERR_INVALID_STATE, TAG,
+                        "epd_wire_diag() must run before epd_bus_init()");
+
+    memset(out, 0, sizeof(*out));
+    epd_wire_set_verdict(out, "INCONCLUSIVE");
+
+    ESP_RETURN_ON_ERROR(epd_bb_init(pins), TAG, "bit-bang init failed");
+
+    /* 3-wire mode has no D/C signal: the spec ties the pin to ground
+     * (Table 7-3, "Tie LOW") and the D/C bit travels inside the frame. Holding
+     * the pin low for the whole diagnostic means neither hypothesis is being
+     * helped along -- and it is also the level epd_bb_cmd() leaves behind, so
+     * the 9-bit frames below never see it move. */
+    epd_bb_set_dc(0);
+
+    /* ---------------------------------------------------------------- F1
+     * Control: the plain 8-bit PON of dctest oracle D, repeated here so the
+     * whole verdict rests on numbers taken in this same run. */
+    epd_bb_reset_pulse();
+    epd_bb_cmd(UC8179_PON);
+    epd_wire_watch("F1 8-bit cmd", out, EPD_WIRE_F1);
+    epd_wire_power_down("F1");
+
+    /* ---------------------------------------------------------------- F2
+     * [0][0x04] as one 9-bit frame, D/C bit first. Powers on only if the
+     * controller really reads nine bits in the spec's order. */
+    epd_bb_set_dc(0);
+    epd_bb_write_frame9(0, UC8179_PON, true);
+    epd_wire_watch("F2 dcfirst cmd", out, EPD_WIRE_F2);
+    epd_wire_power_down("F2");
+
+    /* ---------------------------------------------------------------- F3
+     * Does a 9-bit DATA frame have an effect? DSLP as a D/C-first command
+     * frame, its 0xA5 check byte as a D/C-first data frame, then the 8-bit PON
+     * that is known to run in the current state: pon=no means the data frame
+     * landed and armed deep sleep. The closing reset wakes the controller. */
+    epd_bb_set_dc(0);
+    epd_bb_write_frame9(0, UC8179_DSLP, true);
+    epd_bb_write_frame9(1, UC8179_DSLP_CHECK, true);
+    epd_bus_delay_ms(EPD_DIAG_DSLP_SETTLE_MS);
+    epd_bb_cmd(UC8179_PON);
+    epd_wire_watch("F3 dcfirst data", out, EPD_WIRE_F3);
+    epd_wire_power_down("F3");
+
+    /* ---------------------------------------------------------------- F4
+     * The same command frame with the byte first and the D/C bit last. Powers
+     * on under 3-wire/D/C-last AND under 4-wire, so it decides nothing by
+     * itself: it is the control that makes F5 readable. */
+    epd_bb_set_dc(0);
+    epd_bb_write_frame9(0, UC8179_PON, false);
+    epd_wire_watch("F4 dclast cmd", out, EPD_WIRE_F4);
+    epd_wire_power_down("F4");
+
+    /* ---------------------------------------------------------------- F5
+     * F3's question in the D/C-last order. */
+    epd_bb_set_dc(0);
+    epd_bb_write_frame9(0, UC8179_DSLP, false);
+    epd_bb_write_frame9(1, UC8179_DSLP_CHECK, false);
+    epd_bus_delay_ms(EPD_DIAG_DSLP_SETTLE_MS);
+    epd_bb_cmd(UC8179_PON);
+    epd_wire_watch("F5 dclast data", out, EPD_WIRE_F5);
+    epd_wire_power_down("F5");
+
+    /* --------------------------------------------------------------- verdict
+     * Read in this order, because the D/C-last row of the table above overlaps
+     * the 4-wire one and only the D/C-first oracles separate them cleanly.
+     *
+     * "The panel powered on", not "a BUSY signature appeared": see
+     * epd_wire_powered_on(). F2 is exactly why the distinction has to be made
+     * -- the frame it sends decodes to POF under both hypotheses it is meant to
+     * refute, and this controller's POF pulses BUSY as well. */
+    const bool f1 = out->powered[EPD_WIRE_F1];
+    const bool f2 = out->powered[EPD_WIRE_F2];
+    const bool f3 = out->powered[EPD_WIRE_F3];
+    const bool f4 = out->powered[EPD_WIRE_F4];
+    const bool f5 = out->powered[EPD_WIRE_F5];
+
+    if (f1 && f2 && !f3) {
+        /* A 9-bit command frame powers the panel on and a 9-bit data frame
+         * arms deep sleep: the controller reads nine bits, D/C bit first. */
+        epd_wire_set_verdict(out, "THREE_WIRE_DC_FIRST");
+    } else if (f1 && !f5 && f4 && !f2) {
+        epd_wire_set_verdict(out, "THREE_WIRE_DC_LAST");
+    } else if (f1 && !f2 && f3 && f5) {
+        /* Only the 8-bit frames do anything and no 9-bit data frame ever
+         * lands: the controller is in 4-wire mode after all, and DC_NOT_SEEN
+         * keeps its original, electrical meaning. */
+        epd_wire_set_verdict(out, "FOUR_WIRE");
+    } else {
+        epd_wire_set_verdict(out, "INCONCLUSIVE");
+    }
+
+    if (!f1) {
+        ESP_LOGW(TAG, "wiretest: the control F1 did not power the panel on -- the "
+                      "detector is not sound in this run and the verdict means "
+                      "nothing");
+    }
+    ESP_LOGI(TAG, "wiretest verdict=%s (powered on: F1=%s F2=%s F3=%s F4=%s F5=%s; "
+                  "BUSY released at %d/%d/%d/%d/%d ms, PON is ~131 ms and POF ~41 ms)",
+             out->verdict,
+             f1 ? "yes" : "no", f2 ? "yes" : "no", f3 ? "yes" : "no",
+             f4 ? "yes" : "no", f5 ? "yes" : "no",
+             out->watch[EPD_WIRE_F1].high_ms, out->watch[EPD_WIRE_F2].high_ms,
+             out->watch[EPD_WIRE_F3].high_ms, out->watch[EPD_WIRE_F4].high_ms,
+             out->watch[EPD_WIRE_F5].high_ms);
+
+    return ESP_OK;
+}
+
+void epd_wire_diag_format(const epd_wire_diag_result_t *r, char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return;
+    }
+    if (r == NULL) {
+        buf[0] = '\0';
+        return;
+    }
+    /* Fn_pon is "the panel powered on", the question each oracle asks. The two
+     * trailing fields are the evidence behind it, in oracle order: busy_sig is
+     * the raw low-then-high BUSY_N signature, release_ms the time it took --
+     * ~131 ms for a power-on, ~41 ms for the POF pulse this controller emits
+     * whatever its power state, -1 for "BUSY never came back". A "sig=1" next
+     * to a "pon=no" is therefore not a contradiction, it is a POF. */
+    snprintf(buf, len,
+             "wiretest F1_pon=%s F2_pon=%s F3_pon=%s F4_pon=%s F5_pon=%s "
+             "verdict=%s release_ms=%d,%d,%d,%d,%d busy_sig=%d,%d,%d,%d,%d",
+             r->powered[EPD_WIRE_F1] ? "yes" : "no",
+             r->powered[EPD_WIRE_F2] ? "yes" : "no",
+             r->powered[EPD_WIRE_F3] ? "yes" : "no",
+             r->powered[EPD_WIRE_F4] ? "yes" : "no",
+             r->powered[EPD_WIRE_F5] ? "yes" : "no",
+             r->verdict,
+             r->watch[EPD_WIRE_F1].high_ms, r->watch[EPD_WIRE_F2].high_ms,
+             r->watch[EPD_WIRE_F3].high_ms, r->watch[EPD_WIRE_F4].high_ms,
+             r->watch[EPD_WIRE_F5].high_ms,
+             r->watch[EPD_WIRE_F1].pon, r->watch[EPD_WIRE_F2].pon,
+             r->watch[EPD_WIRE_F3].pon, r->watch[EPD_WIRE_F4].pon,
+             r->watch[EPD_WIRE_F5].pon);
 }

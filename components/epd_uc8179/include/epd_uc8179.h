@@ -135,6 +135,54 @@ esp_err_t epd_dc_diag(const epd_pins_t *pins, epd_dc_diag_result_t *out);
 /* One-line summary of a diagnostic result, for the [EPD-TEST] log. */
 void      epd_dc_diag_format(const epd_dc_diag_result_t *r, char *buf, size_t len);
 
+/*------------------------------------------------ 3-wire / 4-wire diagnostic ----
+ * The innocent explanation for DC_NOT_SEEN that no D/C experiment can reach:
+ * the controller may be strapped into 3-wire serial mode, where the D/C PIN is
+ * not a bus signal at all (spec 3.3-2-3: "The pin DC can be connected to an
+ * external ground") and each frame is nine bits, "DC bit, D7 to D0 bit". A
+ * controller in that mode, whose shift register clears on the falling edge of
+ * CSB and latches on the rising one, reads every 8-bit frame this firmware has
+ * ever sent as [D/C = 0][byte] -- a COMMAND, whatever the D/C pin does. That is
+ * precisely what five hardware runs observed, with no broken line anywhere.
+ *
+ * The five oracles send 9-bit frames instead and watch the same BUSY power-on
+ * signature; see components/epd_uc8179/epd_diag.c for what each one asks.
+ *-------------------------------------------------------------------------------*/
+
+/* The five oracles, in the order epd_wire_diag() runs them. */
+typedef enum {
+    EPD_WIRE_F1 = 0,      /* control: plain 8-bit 0x04, D/C pin low -- expected yes */
+    EPD_WIRE_F2,          /* 9-bit [0][0x04], D/C first -- yes only in 3-wire/D/C-first */
+    EPD_WIRE_F3,          /* D/C-first DSLP + 0xA5 as DATA, then 8-bit PON -- no only if the data frame landed */
+    EPD_WIRE_F4,          /* 9-bit [0x04][0], D/C last -- yes in 3-wire/D/C-last AND in 4-wire */
+    EPD_WIRE_F5,          /* D/C-last DSLP + 0xA5 as DATA, then 8-bit PON -- no only if the data frame landed */
+    EPD_WIRE_ORACLES      /* count, not an oracle */
+} epd_wire_oracle_t;
+
+typedef struct {
+    epd_pon_watch_t watch[EPD_WIRE_ORACLES];   /* the raw BUSY_N observation */
+    bool            powered[EPD_WIRE_ORACLES]; /* ...and whether it was a power-ON */
+    char verdict[24];     /* "THREE_WIRE_DC_FIRST" | "THREE_WIRE_DC_LAST" | "FOUR_WIRE" | "INCONCLUSIVE" */
+} epd_wire_diag_result_t;
+/* Why the two flags are not the same thing, and why the verdict is built on
+ * the second: watch[].pon is only the low-then-high BUSY_N signature, and on
+ * this controller POF produces one too -- a ~41 ms pulse, with the rails up or
+ * down alike (rsttest, six runs). Since two of the five frames below decode to
+ * POF under the hypotheses they are meant to refute, the signature alone
+ * cannot tell "the panel powered on" from "some command ran". The release time
+ * can, and by a factor of three: PON releases BUSY at ~131 ms, POF at ~41 ms.
+ * powered[] is watch[].pon qualified by that duration, and it is what each
+ * oracle was actually asking about. */
+
+/* Run the 3-wire/4-wire oracles over bit-banged GPIO. Same constraints as
+ * epd_dc_diag(): before epd_bus_init(), never refreshes, and every oracle is
+ * closed with a power-off that is sent in all three framings (so the panel ends
+ * up unpowered whichever mode turns out to be real) plus a reset pulse. */
+esp_err_t epd_wire_diag(const epd_pins_t *pins, epd_wire_diag_result_t *out);
+
+/* One-line summary of a wire diagnostic result, for the [EPD-TEST] log. */
+void      epd_wire_diag_format(const epd_wire_diag_result_t *r, char *buf, size_t len);
+
 /*--------------------------------------------------- RST line diagnostic ----
  * Does the hardware reset pulse reach the controller? Nothing has ever proved
  * it: commands, BUSY and power are proven, but every reset so far could have

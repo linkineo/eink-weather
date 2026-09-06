@@ -13,7 +13,7 @@ bring-up** — boot banner on UART, panel probe, "Hello, World!" on the panel. N
 
 - Board: **Waveshare e-Paper ESP32 Driver Board** — ESP32-D0WDQ6 rev v1.0, dual core 240 MHz,
   40 MHz crystal, **4 MB flash (DIO)**, USB-UART **CP2102N** (Apple native driver).
-  Serial port on this Mac: **`/dev/cu.usbserial-110`**. MAC `3c:61:05:11:8f:4c`.
+  Serial port on this Mac: **`/dev/cu.usbserial-110`** or `-10` (depends on the USB port used). MAC `3c:61:05:11:8f:4c`.
   Auto-reset via DTR/RTS works: flashing needs no button.
 - Panel: **Waveshare 7.5inch e-Paper (B) V3** (sticker "V3" on the panel; Waveshare: fully compatible
   with the V2 demo/protocol) — 800×480, **black/white/red**, controller **UC8179C**. Label on the panel: `DEPG0750RWU790F30HP` (DKE; `RW` = red/white tri-color,
@@ -122,6 +122,14 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
    Everything software-side is exhausted: the controller decodes 8-bit command frames (4-wire
    mode) but its D/C input reads low → open on FPC pin 11 (board connector / trace / panel flex).
    Physical checks pending: continuity IO27 ↔ connector pin 11, inspection of contacts 10–11.
+6. **Run 6** (3-wire hypothesis, 9-bit frames, `wiretest`): `[0][0x04]` as a 9-bit frame gives the
+   40 ms POF signature (the controller latched the first 8 bits = 0x02 and dropped the 9th),
+   9-bit DSLP+0xA5 frames never arm deep sleep in either bit order, plain 8-bit PON always works →
+   **FOUR_WIRE**, positively proven. Flipping the FPC in the connector kills all communication
+   (BUSY stuck low, RST read back high through a cross-connection), so the original orientation is
+   the right one and the board-side RST path is electrically intact. Software is exhausted:
+   Waveshare's Loader (same pins, same bit-bang, same init) is the last arbiter to re-run.
+   The board now enumerates as `/dev/cu.usbserial-10` (USB port changed).
 
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a
