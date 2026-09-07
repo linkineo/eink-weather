@@ -32,13 +32,12 @@ bring-up** — boot banner on UART, panel probe, "Hello, World!" on the panel. N
   Panel power: the schematic has a MOSFET switch (GPIO2 → R35 → Q32 → Q31) in front of the
   `EPD_3.3V` LDO and the Waveshare Loader drives GPIO2 and GPIO33 high; the firmware does the same
   (`BOARD_EPD_PWR`, `BOARD_EPD_PWR_AUX`), but on this unit it changed nothing measurable.
-- Switches: SW1 "Display Config" selects the booster current-sense resistor RESE: **A = 0.47 Ω**
-  (SW1 closed shorts R8 2.2 Ω, leaving R7 0.47 Ω), **B ≈ 2.7 Ω** ("3R", R7+R8). Waveshare's table
-  (Driver HAT wiki, same panels) puts 5.83/7.5/7.5 (B) on **0.47 Ω = A** and 1.54/2.13 on 3 Ω.
-  This unit was delivered on **B** and, as of 2026-09-07, **PON never completes in A** (controller
-  hangs until a real power cycle) — plausibly because the controller runs its booster with the
-  register defaults (PWR 07 17 3A 3A 03, BTST 17 17 17 17) since our PWR/BTST parameters never land
-  (D/C fault); keep B until D/C works, then retest A. **SW2 (USB-UART power) must stay ON**.
+- Switches (per the board's own wiki page, "E-Paper ESP32 Driver Board", Hardware Connection):
+  SW1 "Display Config": **B = 0.47 Ω — 7.5inch e-Paper and 7.5inch e-Paper (B) belong here**;
+  A = 3 Ω is for the small panels (1.54/2.13/2.66/2.9/3.7/4.2/13.3). This unit came on B, which is
+  correct. On 2026-09-07 A was tried by mistake (my misreading of the schematic text): with 3 Ω the
+  booster cannot reach its voltages, PON never completes and the controller hangs until a real power
+  cycle. **Keep SW1 on B.** **SW2 (USB-UART power) must stay ON**.
 - Panel safety rules (Waveshare): put the panel to **deep sleep after every refresh** (long
   high-voltage exposure damages it irreversibly); refresh interval **≥ 180 s**; tri-color panels
   should be refreshed at least once every 24 h.
@@ -168,8 +167,8 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
    **with SW1 on A (RESE 0.47 Ω) the PON never completes and the controller hangs until power is
    truly removed** on this board+panel+USB supply; keep SW1 on B for now (it does not affect the
    digital D/C problem). Run 10 = Hello World refresh with SW1 on B → white/black/noise again.
-   The user states the board displayed images in the past with SW1 on B; treat B as a valid
-   operating point for this pair.
+   The user states the board displayed images in the past with SW1 on B — and the board's wiki
+   confirms B (0.47 Ω) is the documented position for 7.5" panels; my earlier "A" claim was wrong.
 11. **Run 11 — pressure ("wiggle") test, 2026-09-07.** Six diag passes while the user pressed on the
     FPC / connector latch / flex. Passes 1–3 and 6: `DC_NOT_SEEN` (D,A,B,E all yes). Pass 4 under
     pressure: `D=yes A=yes B=no E=no`; pass 5: `D=no A=yes B=no E=no` → data bytes intermittently
