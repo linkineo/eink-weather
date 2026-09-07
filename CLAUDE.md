@@ -158,6 +158,11 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
    pin 10, adjacent to the open D/C pin 11? or damaged during the full-current PON). No software
    oracle can run against a silent controller. Next: reconnect through the adapter+FFC chain (where
    commands used to work), macro inspection of flex contacts 10–11, or test with another panel/board.
+   **Resolved:** the USB had not really been unplugged; after a genuine power cycle with SW1 back on
+   **B** the controller answers exactly as before (PON 131 ms, refresh 17.8 s, POF 44 ms). Lesson:
+   **with SW1 on A (RESE 0.47 Ω) the PON never completes and the controller hangs until power is
+   truly removed** on this board+panel+USB supply; keep SW1 on B for now (it does not affect the
+   digital D/C problem). Run 10 = Hello World refresh with SW1 on B, panel content to be checked.
 
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a
