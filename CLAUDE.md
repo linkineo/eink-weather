@@ -32,8 +32,13 @@ bring-up** — boot banner on UART, panel probe, "Hello, World!" on the panel. N
   Panel power: the schematic has a MOSFET switch (GPIO2 → R35 → Q32 → Q31) in front of the
   `EPD_3.3V` LDO and the Waveshare Loader drives GPIO2 and GPIO33 high; the firmware does the same
   (`BOARD_EPD_PWR`, `BOARD_EPD_PWR_AUX`), but on this unit it changed nothing measurable.
-- Switches: **SW1 "Display Config" must be on A (0.47 Ω)** for 7.5" panels (B = 3 Ω is for the
-  small 1.54/2.13/2.9 b/w panels). **SW2 (USB-UART power) must stay ON** or flashing stops working.
+- Switches: SW1 "Display Config" selects the booster current-sense resistor RESE: **A = 0.47 Ω**
+  (SW1 closed shorts R8 2.2 Ω, leaving R7 0.47 Ω), **B ≈ 2.7 Ω** ("3R", R7+R8). Waveshare's table
+  (Driver HAT wiki, same panels) puts 5.83/7.5/7.5 (B) on **0.47 Ω = A** and 1.54/2.13 on 3 Ω.
+  This unit was delivered on **B** and, as of 2026-09-07, **PON never completes in A** (controller
+  hangs until a real power cycle) — plausibly because the controller runs its booster with the
+  register defaults (PWR 07 17 3A 3A 03, BTST 17 17 17 17) since our PWR/BTST parameters never land
+  (D/C fault); keep B until D/C works, then retest A. **SW2 (USB-UART power) must stay ON**.
 - Panel safety rules (Waveshare): put the panel to **deep sleep after every refresh** (long
   high-voltage exposure damages it irreversibly); refresh interval **≥ 180 s**; tri-color panels
   should be refreshed at least once every 24 h.
