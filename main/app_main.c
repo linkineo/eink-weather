@@ -7,6 +7,13 @@
  * ONE panel refresh per boot (Waveshare rule: never leave the panel powered,
  * keep refreshes rare), then a heartbeat every 10 s forever.
  *
+ * CONFIG_APP_MINIMAL_DISPLAY strips that flow down to the shortest path from
+ * reset to ink: banner, panel power, bus, epd_init(), the same composed image,
+ * epd_display(), epd_sleep(), then a silent idle loop. No probe (which would
+ * cost the panel an extra reset/PON/POF cycle), no diagnostics, no heartbeat
+ * spam. That is the build to run while working on the FPC connector: press EN,
+ * watch the glass, repeat.
+ *
  * CONFIG_APP_DIAG_ONLY replaces the display bring-up with the diagnostics of
  * components/epd_uc8179/epd_diag.c -- epd_dc_diag(), epd_wire_diag(),
  * epd_rst_diag() -- and nothing else: no bus, no epd_init(), no image, no
@@ -39,11 +46,30 @@
 #include "epd_uc8179.h"
 #include "test_log.h"
 
-#if !CONFIG_APP_DIAG_ONLY
+/*
+ * The three mutually exclusive build modes, resolved once here so that no
+ * other line in this file has to know the precedence rule: MINIMAL wins over
+ * DIAG. Kconfig symbols that are not set are simply undefined, which #if reads
+ * as 0.
+ */
+#if CONFIG_APP_MINIMAL_DISPLAY
+#define APP_MODE_MINIMAL 1
+#else
+#define APP_MODE_MINIMAL 0
+#endif
+#define APP_MODE_DIAG    (!APP_MODE_MINIMAL && CONFIG_APP_DIAG_ONLY)
+#define APP_MODE_DISPLAY (!APP_MODE_MINIMAL && !APP_MODE_DIAG)
+
+#if !APP_MODE_DIAG
 #include "gfx.h"
 #endif
 
+/* The minimal build must stay quiet: the user reads the glass, not the UART. */
+#if APP_MODE_MINIMAL
+#define HEARTBEAT_PERIOD_MS 60000
+#else
 #define HEARTBEAT_PERIOD_MS 10000
+#endif
 
 static const char *TAG = "app";
 
@@ -60,7 +86,7 @@ static const epd_pins_t k_pins = {
     .spi_hz  = BOARD_EPD_SPI_HZ,
 };
 
-#if !CONFIG_APP_DIAG_ONLY
+#if !APP_MODE_DIAG
 /* The two 1-bpp planes. 48000 bytes each is far too much for any task stack,
  * and .bss on internal RAM is exactly what the SPI driver prefers (DMA
  * capable), so they are static. */
@@ -70,7 +96,7 @@ static uint8_t s_black[GFX_PLANE_BYTES];
 static uint8_t s_red[GFX_PLANE_BYTES];
 #endif
 
-#if !CONFIG_APP_DIAG_ONLY
+#if !APP_MODE_DIAG
 /*===========================================================================
  * Layout of the bring-up image (800 x 480)
  *
@@ -97,7 +123,7 @@ static uint8_t s_red[GFX_PLANE_BYTES];
 #define LAYOUT_DISC_R       40
 
 static const char k_title[] = "Hello, World!";
-#endif /* !CONFIG_APP_DIAG_ONLY */
+#endif /* !APP_MODE_DIAG */
 
 /*===========================================================================
  * Chip / reset helpers, shared by the UART banner and the panel image
@@ -193,7 +219,7 @@ static void print_boot_banner(void)
                  esp_get_free_heap_size());
 }
 
-#if !CONFIG_APP_DIAG_ONLY
+#if !APP_MODE_DIAG
 /*===========================================================================
  * Image composition
  *===========================================================================*/
@@ -215,6 +241,7 @@ static UWORD title_x(UWORD width)
     return (UWORD)((GFX_PANEL_WIDTH - width) / 2);
 }
 
+/* probe == NULL: this build never probed the controller (APP_MODE_MINIMAL). */
 static void compose_black(const epd_probe_result_t *probe)
 {
     char buf[128];
@@ -287,9 +314,13 @@ static void compose_black(const epd_probe_result_t *probe)
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
 
-    snprintf(buf, sizeof(buf), "probe %s  busy %d/%d ms",
-             probe->verdict,
-             probe->busy_low_ms, probe->busy_release_ms);
+    if (probe != NULL) {
+        snprintf(buf, sizeof(buf), "probe %s  busy %d/%d ms",
+                 probe->verdict,
+                 probe->busy_low_ms, probe->busy_release_ms);
+    } else {
+        snprintf(buf, sizeof(buf), "probe skipped");
+    }
     draw_line(LAYOUT_INFO_X, y, buf, &Font20);
     y += LAYOUT_INFO_STEP;
 
@@ -333,6 +364,71 @@ static void compose_red(void)
               (UWORD)(LAYOUT_DISC_CY + LAYOUT_DISC_R + 6), label, &Font20);
 }
 
+/* The whole image, both planes, exactly as every display build shows it.
+ * Shared by the normal flow and by APP_MODE_MINIMAL so the two can never drift
+ * apart; the only visible difference is the probe line (see compose_black()). */
+static void compose_planes(const epd_probe_result_t *probe)
+{
+    compose_black(probe);
+    compose_red();
+}
+#endif /* !APP_MODE_DIAG */
+
+#if APP_MODE_MINIMAL
+/*===========================================================================
+ * Minimal mode (CONFIG_APP_MINIMAL_DISPLAY)
+ *===========================================================================*/
+
+/*
+ * Bus, init, one image, sleep -- and not one panel operation more. No probe:
+ * its reset/PON/POF cycle would run before the init sequence the panel is
+ * actually judged on, and the point of this build is that pressing EN gives
+ * the controller exactly one reset and exactly one refresh.
+ *
+ * Same error contract as display_bringup(): an [EPD-TEST] ERROR line names the
+ * stage, and every exit path after init has attempted epd_sleep(), because a
+ * panel left powered is damaged by the sustained high voltage.
+ */
+static esp_err_t minimal_display(void)
+{
+    esp_err_t err = epd_bus_init(&k_pins);
+    if (err != ESP_OK) {
+        EPD_TEST_LOG("ERROR stage=bus err=%s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = epd_init();
+    if (err != ESP_OK) {
+        EPD_TEST_LOG("ERROR stage=init err=%s", esp_err_to_name(err));
+        (void)epd_sleep();
+        return err;
+    }
+    EPD_TEST_LOG("init ok");
+
+    compose_planes(NULL);
+
+    const int64_t t_refresh = esp_timer_get_time();
+    err = epd_display(s_black, s_red);
+    const int64_t refresh_ms = (esp_timer_get_time() - t_refresh) / 1000;
+    if (err != ESP_OK) {
+        EPD_TEST_LOG("ERROR stage=display err=%s", esp_err_to_name(err));
+        (void)epd_sleep();
+        return err;
+    }
+    EPD_TEST_LOG("refresh_ms=%lld", refresh_ms);
+
+    err = epd_sleep();
+    if (err != ESP_OK) {
+        EPD_TEST_LOG("ERROR stage=sleep err=%s", esp_err_to_name(err));
+        return err;
+    }
+    EPD_TEST_LOG("sleep ok");
+
+    return ESP_OK;
+}
+#endif /* APP_MODE_MINIMAL */
+
+#if APP_MODE_DISPLAY
 /*===========================================================================
  * Display bring-up
  *===========================================================================*/
@@ -383,8 +479,7 @@ static esp_err_t display_bringup(void)
     EPD_TEST_LOG("init ok");
     EPD_TEST_LOG("datapath=%s", epd_datapath_name());
 
-    compose_black(&probe);
-    compose_red();
+    compose_planes(&probe);
 
     const int64_t t_refresh = esp_timer_get_time();
     err = epd_display(s_black, s_red);
@@ -405,9 +500,9 @@ static esp_err_t display_bringup(void)
 
     return ESP_OK;
 }
-#endif /* !CONFIG_APP_DIAG_ONLY */
+#endif /* APP_MODE_DISPLAY */
 
-#if CONFIG_APP_DIAG_ONLY
+#if APP_MODE_DIAG
 /*===========================================================================
  * Diagnostic mode (CONFIG_APP_DIAG_ONLY)
  *===========================================================================*/
@@ -472,7 +567,7 @@ static esp_err_t diag_only(void)
 
     return ESP_OK;
 }
-#endif /* CONFIG_APP_DIAG_ONLY */
+#endif /* APP_MODE_DIAG */
 
 /*
  * Bring the panel rail up and say so. Every driver entry point does this by
@@ -506,7 +601,13 @@ void app_main(void)
      * on BUSY, not enough to latch D/C or a single data byte. */
     const bool powered = (panel_power_on() == ESP_OK);
 
-#if CONFIG_APP_DIAG_ONLY
+#if APP_MODE_MINIMAL
+    /* Minimal build: init, one image, panel asleep, then nothing. Re-run it by
+     * pressing EN -- every reset repeats exactly this sequence. */
+    if (powered && minimal_display() == ESP_OK) {
+        EPD_TEST_LOG("DONE");
+    }
+#elif APP_MODE_DIAG
     /* Diagnostic build: the panel is never refreshed, only questioned. */
     if (powered && diag_only() == ESP_OK) {
         EPD_TEST_LOG("DONE");

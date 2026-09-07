@@ -1,5 +1,25 @@
 menu "eink-weather bring-up"
 
+    config APP_MINIMAL_DISPLAY
+        bool "Boot -> init -> Hello World -> panel sleep, nothing else (no probe, no diagnostics)"
+        default n
+        help
+            The shortest path from reset to ink. app_main() prints the boot
+            banner, brings the panel rail up, initialises the bus and the
+            controller, composes the same "Hello, World!" planes as the normal
+            build, refreshes once, puts the panel into deep sleep and then
+            idles silently (one heartbeat per minute at most).
+
+            What it deliberately leaves out: epd_probe() -- which costs an
+            extra reset/PON/POF cycle before the real init sequence -- and all
+            of the D/C diagnostics. The panel therefore sees exactly one reset
+            and exactly one refresh per boot, which makes the mode the right
+            one for hardware work on the FPC connector: press EN, watch the
+            glass, repeat. The info line that normally reports the probe
+            verdict reads "probe skipped".
+
+            Wins over APP_DIAG_ONLY when both are set.
+
     config APP_DIAG_ONLY
         bool "Run the panel wiring diagnostics instead of displaying; never refreshes the panel"
         default n

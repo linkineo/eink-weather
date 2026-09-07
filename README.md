@@ -93,6 +93,15 @@ idf.py build
 
 and check the resulting `[EPD-TEST] datapath=` line in the capture.
 
+### Minimal display mode
+
+`CONFIG_APP_MINIMAL_DISPLAY=y` (menu "eink-weather bring-up", wins over
+`CONFIG_APP_DIAG_ONLY`) reduces the boot to banner → panel power → `epd_init()`
+→ the same "Hello, World!" image (its info line reads `probe skipped`) →
+`epd_display()` → `epd_sleep()` → silent idle: no probe, no diagnostics, one
+reset and one refresh per boot, so the display can be re-run by pressing EN
+while working on the FPC connector.
+
 ### Diagnostic mode: does the controller see D/C?
 
 `CONFIG_APP_DIAG_ONLY=y` replaces the whole display path with
@@ -170,7 +179,7 @@ Arduino demo is still unknown.
 CMakeLists.txt         project definition
 sdkconfig.defaults     target, flash and console settings
 main/                  application: app_main.c, board.h, test_log.h,
-                       Kconfig.projbuild (APP_DIAG_ONLY)
+                       Kconfig.projbuild (APP_MINIMAL_DISPLAY, APP_DIAG_ONLY)
 components/gfx/        1-bpp framebuffer and drawing primitives
                        (vendored Waveshare GUI_Paint + STM fonts, gfx_* helpers)
 components/epd_uc8179/ UC8179 panel driver: epd_bus.c (write path, plain
