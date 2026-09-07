@@ -167,7 +167,15 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
    **B** the controller answers exactly as before (PON 131 ms, refresh 17.8 s, POF 44 ms). Lesson:
    **with SW1 on A (RESE 0.47 Ω) the PON never completes and the controller hangs until power is
    truly removed** on this board+panel+USB supply; keep SW1 on B for now (it does not affect the
-   digital D/C problem). Run 10 = Hello World refresh with SW1 on B, panel content to be checked.
+   digital D/C problem). Run 10 = Hello World refresh with SW1 on B → white/black/noise again.
+   The user states the board displayed images in the past with SW1 on B; treat B as a valid
+   operating point for this pair.
+11. **Run 11 — pressure ("wiggle") test, 2026-09-07.** Six diag passes while the user pressed on the
+    FPC / connector latch / flex. Passes 1–3 and 6: `DC_NOT_SEEN` (D,A,B,E all yes). Pass 4 under
+    pressure: `D=yes A=yes B=no E=no`; pass 5: `D=no A=yes B=no E=no` → data bytes intermittently
+    stopped executing as commands while pressure was applied, and one command was lost. **The D/C
+    fault is a pressure-sensitive contact**, not firmware. Next: localise the spot, hold pressure,
+    get a stable `DC_OK`, then run the display firmware under pressure for the visual proof.
 
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a
