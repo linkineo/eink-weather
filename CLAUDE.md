@@ -174,8 +174,14 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
     FPC / connector latch / flex. Passes 1–3 and 6: `DC_NOT_SEEN` (D,A,B,E all yes). Pass 4 under
     pressure: `D=yes A=yes B=no E=no`; pass 5: `D=no A=yes B=no E=no` → data bytes intermittently
     stopped executing as commands while pressure was applied, and one command was lost. **The D/C
-    fault is a pressure-sensitive contact**, not firmware. Next: localise the spot, hold pressure,
-    get a stable `DC_OK`, then run the display firmware under pressure for the visual proof.
+    fault may be a pressure-sensitive contact**. Follow-up: 3 passes with steady pressure on the
+    latch and 6 passes with one action each (press flex, push in, lift, flex left/right, control)
+    all gave `DC_NOT_SEEN`. The passes 4–5 flips are therefore better read as command bytes
+    corrupted by the movement (a lost PON has no signature) than as D/C recovering: the link is
+    mechanically marginal, but D/C never came back. Software cannot go further; remaining
+    candidates: open/short on the D/C path (board connector pin 11, board trace or series part,
+    panel flex contact 11) or a damaged D/C input in the controller. Physical measurement or a
+    part swap is required. Display firmware left on the board (Hello World at every boot).
 
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a
