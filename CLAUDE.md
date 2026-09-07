@@ -149,6 +149,15 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
    Confirmed by running the vendor demo with only the normal-mode drawing block: the refresh
    started at +20.6 s and BUSY never released in 150 s. **Vendor code fails identically → the D/C
    line is open on this board/panel pair today**, whatever worked in the past.
+9. **Run 9 (2026-09-07) — switch 1 episode.** The user found SW1 on **B** since purchase (film still
+   on). Schematic: RESE always goes through R7 0.47 Ω; B leaves R8 2.2 Ω in series (≈2.7 Ω), A
+   shorts R8. Moving SW1 to A: first run PON started (BUSY low) but never completed; after a power
+   cycle the controller stopped answering entirely — BUSY held high, no PON signature, no refresh —
+   in A and back in B, after reseating the FPC and several power cycles. BUSY driven high means the
+   panel is connected and powered but ignores commands (held in reset via a floating RST_N on FPC
+   pin 10, adjacent to the open D/C pin 11? or damaged during the full-current PON). No software
+   oracle can run against a silent controller. Next: reconnect through the adapter+FFC chain (where
+   commands used to work), macro inspection of flex contacts 10–11, or test with another panel/board.
 
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a
