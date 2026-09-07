@@ -182,6 +182,21 @@ Log contract for automation: every machine-readable line starts with `[EPD-TEST]
     panel flex contact 11) or a damaged D/C input in the controller. Physical measurement or a
     part swap is required. Display firmware left on the board (Hello World at every boot).
 
+12. **Run 12 — definitive vendor arbitration (2026-09-07).** Followed the board's wiki
+    (E-Paper_ESP32_Driver_Board) to the letter: downloaded the official demo archive, installed
+    `esp32-waveshare-epd` into the Arduino sketchbook, compiled and flashed BOTH matched 7.5"
+    demos **unmodified** — `epd7in5b_V2-demo` (tricolor) and `epd7in5_V2-demo` (mono), on SW1=B.
+    **Both produce the same pixel noise on the glass; neither displays.** Since the vendor's own
+    model-matched firmware fails identically, the fault is not our code, not a driver/panel
+    mismatch, and not the switch. Conclusion accepted with the user: **hardware fault on the D/C
+    line** (the diagnostic already showed the controller never sees D/C high; commands work, data
+    never lands). Also seen: the panel intermittently goes fully mute (BUSY released after 0 ms,
+    no PON signature) and needs a true power cycle to recover; one mono-demo flash triggered a
+    brownout reboot loop. Remaining action is physical: continuity IO27 ↔ FPC pin 11, inspect
+    the panel-side flex contacts, or swap the panel/board. Firmware side is DONE and correct
+    (driver, probe, Hello World, diagnostics, minimal mode) — it will work as soon as D/C is
+    electrically restored.
+
 Panel-care rule during bring-up: one refresh per flash cycle, ≥ 60 s between refreshes, sleep
 after every refresh; use `--after no_reset` when flashing so a capture reset does not cause a
 second, interrupted refresh.
