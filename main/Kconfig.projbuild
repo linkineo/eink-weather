@@ -1,62 +1,37 @@
-menu "eink-weather bring-up"
+menu "Weather display"
 
-    config APP_MINIMAL_DISPLAY
-        bool "Boot -> init -> Hello World -> panel sleep, nothing else (no probe, no diagnostics)"
-        default n
+    config WEATHER_POLL_MINUTES
+        int "Ecowitt poll / display refresh interval (minutes)"
+        range 1 1440
+        default 15
         help
-            The shortest path from reset to ink. app_main() prints the boot
-            banner, brings the panel rail up, initialises the bus and the
-            controller, composes the same "Hello, World!" planes as the normal
-            build, refreshes once, puts the panel into deep sleep and then
-            idles silently (one heartbeat per minute at most).
+            Refresh slots are aligned to multiples of this many minutes past
+            local midnight (15 -> :00, :15, :30, :45). Pick a divisor of 1440.
 
-            What it deliberately leaves out: epd_probe() -- which costs an
-            extra reset/PON/POF cycle before the real init sequence -- and all
-            of the D/C diagnostics. The panel therefore sees exactly one reset
-            and exactly one refresh per boot, which makes the mode the right
-            one for hardware work on the FPC connector: press EN, watch the
-            glass, repeat. The info line that normally reports the probe
-            verdict reads "probe skipped".
+    config WEATHER_FETCH_LEAD_SECONDS
+        int "Start the data fetch this many seconds before each slot"
+        range 0 600
+        default 30
 
-            Wins over APP_DIAG_ONLY when both are set.
-
-    config APP_DIAG_ONLY
-        bool "Run the panel wiring diagnostics instead of displaying; never refreshes the panel"
-        default n
+    config WEATHER_WAKE_LEAD_SECONDS
+        int "Wake from deep sleep this many seconds before each slot"
+        range 10 600
+        default 60
         help
-            Electrical diagnostic mode. app_main() prints the boot banner, runs
-            epd_dc_diag(), epd_wire_diag() and epd_rst_diag() over bit-banged
-            GPIO and stops: no epd_init(), no epd_display(), no refresh. The
-            panel is left powered off (POF) and in its post-reset idle state,
-            so the mode is safe to repeat as often as needed -- unlike a
-            refresh, which ages the glass and must stay rare.
+            Covers boot, Wi-Fi association, SNTP and RTC clock drift. Must be
+            larger than WEATHER_FETCH_LEAD_SECONDS.
 
-            The question it answers: does the controller see the D/C line at
-            all? Single-byte commands (PON, DRF, POF) demonstrably work on this
-            board while every data byte -- init parameters and image bytes
-            alike -- appears to be ignored, which is exactly what a D/C line
-            stuck low at the controller would look like: every byte is then
-            read as a command.
+    config WEATHER_TZ
+        string "POSIX timezone for date and last-update time"
+        default "CET-1CEST,M3.5.0,M10.5.0/3"
+        help
+            Default is Central European Time (the station reports Europe/Zurich).
 
-            epd_dc_diag() answers it without refreshing by using the BUSY
-            power-on signature as an oracle: it sends 0x04 (PON) sometimes as a
-            command and sometimes as a data byte and watches whether the
-            controller powers up. See components/epd_uc8179/epd_diag.c.
-
-            The other two narrow down the answer. epd_wire_diag() asks whether
-            there is a D/C line to see at all: in 3-wire mode the pin is tied
-            to ground and the D/C bit travels as the first of nine bits in each
-            frame, so an 8-bit frame reads as a command whatever the pin does
-            -- exactly what has been observed. It sends 9-bit frames and reads
-            the same BUSY oracle. epd_rst_diag() asks whether the hardware
-            reset pulse reaches the controller at all -- RST and D/C are
-            adjacent contacts on the panel FPC, so two dead lines mean a
-            mechanical fault where one dead line does not -- by timing the
-            BUSY_N low pulse that POF produces with and without a reset in
-            between.
-
-            epd_dcscan(), which drives each free GPIO as a second D/C line to
-            exclude a board revision that wires D/C elsewhere, is still in the
-            driver but no longer called: three runs found no such pin.
+    config ECOWITT_MAC
+        string "Ecowitt station MAC (leave empty to auto-detect)"
+        default ""
+        help
+            If empty, the first device returned by /device/list for the API
+            keys is used and cached in NVS.
 
 endmenu

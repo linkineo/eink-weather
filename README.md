@@ -1,242 +1,144 @@
-# eink-weather
+# eink-weather — Météo Hésingue
 
-ESP32 firmware for an e-ink weather display. Weather data will later be pulled
-from an Ecowitt station; the current stage is **hardware bring-up** — boot,
-identify the chip and drive the panel.
+ESP-IDF firmware that shows a personal **Ecowitt** weather station on a
+**CrowPanel ESP32-S3 5.79" e-paper** display: indoor/outdoor temperature, rain now /
+rain today, solar irradiance gauge, wind direction and speed. It refreshes every
+15 minutes on the wall clock (:00, :15, :30, :45) and deep-sleeps in between.
 
-## Hardware
+![Design B](docs/img/design-b-mockup.png)
 
-- **Board:** Waveshare *e-Paper ESP32 Driver Board* (ESP32-D0WDQ6 rev 1.0,
-  dual core, 4 MB flash DIO, CP2102N USB-UART).
-- **Panel:** Waveshare 7.5inch e-Paper (B) V2, 800x480, black/white/red
-  (DKE DEPG0750RWU790F30HP, UC8179C controller).
-- **Switches:** SW1 "Display Config" must be on **A (0.47R)** for 7.5" panels,
-  SW2 (USB-UART power) must be **ON**.
+| Firmware render (dry) | Firmware render (raining) |
+|---|---|
+| ![dry](docs/img/firmware-render-dry.png) | ![raining](docs/img/firmware-render-raining.png) |
 
-### Pin map
+- Product spec (content, states, schedule, data mapping): [`docs/SPEC.md`](docs/SPEC.md)
+- How the display is driven, plus lessons learned: [`docs/DISPLAY_NOTES.md`](docs/DISPLAY_NOTES.md)
+
+---
+
+## 1. Hardware / platform
+
+| Item | Value |
+|---|---|
+| Product | Elecrow **CrowPanel ESP32 E-Paper HMI 5.79-inch Display**, model **DIS08792E** |
+| Wiki | https://www.elecrow.com/wiki/CrowPanel_ESP32_E-paper_5.79-inch_HMI_Display.html |
+| Vendor code (GitHub) | https://github.com/Elecrow-RD/CrowPanel-ESP32-5.79-E-paper-HMI-Display-with-272-792 |
+| Schematic & PCB | https://www.elecrow.com/download/product/CrowPanel/E-paper/5.79-DIS08792E/CrowPanel-ESP32-Display-5.79E-Inch.zip |
+| Vendor Arduino demos / examples | `…/5.79-DIS08792E/Arduino/Demos.zip`, `…/Arduino/Examples.zip` (same download path as above) |
+| MCU module | **ESP32-S3-WROOM-1-N8R8** (dual-core Xtensa LX7, up to 240 MHz), **8 MB flash, 8 MB PSRAM** |
+| Chip seen by esptool | ESP32-S3 (QFN56), revision v0.2 |
+| Panel | 5.79" AM EPD, **792 × 272 px**, black/white, active area 139.00 × 47.74 mm |
+| Panel controllers | **2 × SSD1683** (master + slave, cascaded; each drives 396 columns) |
+| Panel interface | SPI (bit-banged by the vendor driver), see pin map |
+| USB | USB-C, WCH USB-serial bridge (USB VID 0x1A86, enumerates as "USB Serial"; macOS port `/dev/cu.usbserial-*`) |
+| Power | USB-C 5 V; 3.7 V Li-ion via SH1.0 2-pin connector (on-board charger) |
+| Other I/O (unused) | Menu IO2, Exit IO1, rotary Up IO6 / Down IO4 / Conf IO5, TF card (MOSI IO40, MISO IO13, CLK IO39, CS IO10) |
+
+### E-paper pin map (from the vendor driver, `components/crowpanel_epd/spi.h`)
 
 | Signal | GPIO |
-| ------ | ---- |
-| SCK    | 13   |
-| MOSI / DIN | 14 |
-| CS     | 15   |
-| DC     | 27   |
-| RST    | 26   |
-| BUSY   | 25   |
-| PWR (panel rail enable) | 2 |
-| PWR aux (header only)   | 33 |
+|---|---|
+| SCK | 12 |
+| MOSI (DIN) | 11 |
+| CS | 45 |
+| D/C | 46 |
+| RES (reset) | 47 |
+| BUSY (input) | 48 |
+| Panel power enable (high = on) | 7 |
 
-SPI clock at bring-up is 4 MHz. See `main/board.h`.
+The wiki does not list these; they come from Elecrow's example code.
 
-**The panel has a software-controlled power rail, and it must be switched on
-first.** GPIO2 runs through R35 to the base of Q32, which drives the P-MOSFET
-Q31 in front of the RT9193 LDO that produces the panel rail `EPD_3.3V`: GPIO2
-high = panel powered, and the reset state (low) leaves the panel dark.
-Waveshare's own "Loader" firmware for this board calls the pin `PIN_SPI_CS_S`
-and drives it high in `EPD_initSPI()` before it configures any other pin;
-`PIN_SPI_PWR` (GPIO33) goes high in the same place and only reaches the
-expansion header here, but is driven high too for parity. The driver raises
-both at the top of `epd_bb_init_ctrl()`, so `epd_probe()`, `epd_dc_diag()`,
-`epd_rst_diag()`, `epd_dcscan()` and `epd_bus_init()` all get power before
-they touch a pin; `epd_power(bool)` switches the rail explicitly, and waits
-200 ms the first time it comes up. Before wave 6 this pin was left low: the
-controller ran on the leakage current of the signal lines, which is enough to
-answer commands on BUSY (PON, DRF, POF all worked) but not to latch D/C or a
-single data byte — so every diagnostic read `verdict=DC_NOT_SEEN` and every
-refresh produced noise.
+## 2. Toolchain (pinned, so it can be rebuilt later)
 
-**The controller cannot be read back, and the firmware no longer tries.**
-The 7.5inch e-Paper V2 specification says it twice, once for each serial mode:
-"Under serial mode, only write operations are allowed." Two hardware runs
-confirmed it — through the SPI peripheral in half-duplex 3-wire mode and
-through hand-clocked GPIO — and both times a read returned the last bit the
-ESP32 had driven on the shared SDA line, never controller data. So there is no
-chip revision, no status flag word, no panel temperature and no glass-check
-result to display anywhere: `epd_probe()` detects the panel from the **BUSY
-power-on signature** alone (BUSY_N goes low while PON brings the rails up, then
-returns high), and that is the only thing this controller ever tells us about
-itself.
+| Component | Version |
+|---|---|
+| ESP-IDF | branch `release/v5.0`, commit **`d9f9b7d`** (`git describe`: v5.0.8-452-gd9f9…) |
+| Compiler | `xtensa-esp32s3-elf` **esp-2022r1, GCC 11.2.0** (installed by `idf_tools.py`) |
+| Python | 3.9 (macOS system Python works); ESP-IDF venv `idf5.0_py3.9_env` |
+| Host tools | CMake + Ninja (Homebrew), Git |
+| Asset generator | Python 3 + Pillow (only to regenerate fonts/icons) |
 
-## Quick start
+Setup on a fresh Mac/Linux box, keeping all ESP-IDF tools **inside this project**
+(`./.espressif`, git-ignored):
 
 ```sh
-source tools/env.sh          # activate ESP-IDF v5.0.8
-idf.py set-target esp32      # once, generates sdkconfig from sdkconfig.defaults
-idf.py build
-tools/flash.sh --capture     # build, flash and verify the UART output
+git clone -b release/v5.0 --recursive https://github.com/espressif/esp-idf.git ~/devl/esp-idf
+git -C ~/devl/esp-idf checkout d9f9b7d && git -C ~/devl/esp-idf submodule update --init --recursive
+export IDF_TOOLS_PATH=$PWD/.espressif IDF_PATH=~/devl/esp-idf
+python3 $IDF_PATH/tools/idf_tools.py install --targets esp32s3
+python3 $IDF_PATH/tools/idf_tools.py install-python-env
 ```
 
-The serial port is auto-detected as the first `/dev/cu.usbserial*` device node
-(the board enumerates as `-10` or `-110` depending on which USB port it is
-plugged into), by both `tools/flash.sh` and `tools/capture.py`. Override it with
-`PORT=/dev/cu.xxx tools/flash.sh` or `capture.py --port /dev/cu.xxx`; the port
-actually used is printed in the `[capture]` line.
+Then in every shell: `source tools/env.sh`.
 
-### Data path and the bit-bang fallback
+## 3. Credentials (never committed)
 
-Commands and image data go out over the SPI peripheral as a plain full-duplex,
-write-only device. The half-duplex + 3-wire configuration that an earlier
-revision used (so that reads could share the device) let short commands
-through but silently dropped the 4000-byte DMA image chunks, and the panel came
-up as noise; reads never worked either way, so nothing was lost by dropping it.
+Create two files in the project root (both are in `.gitignore`):
 
-`CONFIG_EPD_DATA_BITBANG=y` replaces the whole write path with the hand-clocked
-GPIO transport of `components/epd_uc8179/epd_bitbang.c` (the same one the probe
-always uses). It is a diagnostic: about 1 s per 48000-byte plane instead of
-96 ms, but with no peripheral and no DMA in the picture. Turn it on without
-menuconfig with
+```
+# wifi_creds
+SSID=<your network>
+PASSWORD=<your password>
+
+# ecowitt_creds   (from ecowitt.net → User Center → Private Center)
+api_key=<API key>
+app_key=<Application key>
+```
+
+CMake reads them and generates `secrets.h` in the build folder only. The station
+MAC is discovered with `/device/list` and cached in NVS (override:
+`CONFIG_ECOWITT_MAC`). The secrets end up in the firmware image, so treat a
+flashed board as holding them.
+
+## 4. Build, flash, monitor
 
 ```sh
-sed -i '' 's|^# CONFIG_EPD_DATA_BITBANG is not set$|CONFIG_EPD_DATA_BITBANG=y|' sdkconfig
+source tools/env.sh
 idf.py build
+idf.py -p /dev/cu.usbserial-XXXX flash monitor     # Ctrl-] to quit
 ```
 
-and check the resulting `[EPD-TEST] datapath=` line in the capture.
+Settings: `idf.py menuconfig` → **Weather display** (refresh minutes, fetch lead
+30 s, wake lead 60 s, POSIX timezone, station MAC). After changing Kconfig
+options, run `idf.py reconfigure` if a new `CONFIG_…` symbol is not found.
 
-### Minimal display mode
+Expected log per cycle: `Timer wake` → Wi-Fi connected → `RTC drift …` →
+`ecowitt: in …C out …C | rain … | solar … | wind …` → `Panel updated` →
+`Slot ready N s early` → `Deep sleep for N s`.
 
-`CONFIG_APP_MINIMAL_DISPLAY=y` (menu "eink-weather bring-up", wins over
-`CONFIG_APP_DIAG_ONLY`) reduces the boot to banner → panel power → `epd_init()`
-→ the same "Hello, World!" image (its info line reads `probe skipped`) →
-`epd_display()` → `epd_sleep()` → silent idle: no probe, no diagnostics, one
-reset and one refresh per boot, so the display can be re-run by pressing EN
-while working on the FPC connector.
-
-### Diagnostic mode: does the controller see D/C?
-
-`CONFIG_APP_DIAG_ONLY=y` replaces the whole display path with
-`epd_dc_diag()` (`components/epd_uc8179/epd_diag.c`). It answers one
-electrical question — does the controller see the D/C (data/command) line? —
-and **never refreshes the panel**, so unlike the display build it can be run
-as often as needed.
-
-The question is worth asking because commands demonstrably work here (PON
-pulls BUSY low and releases it, DRF runs a real 17.8 s tri-colour refresh)
-while data bytes apparently never do: both planes are clocked out in full and
-the glass still comes up as random noise, i.e. the controller's RAM was never
-written. A D/C line stuck low at the controller — an open contact on the FPC
-or FFC, a broken trace — produces exactly that: every byte becomes a command,
-so PON/DRF/POF still work and image bytes are executed as invalid commands.
-
-With reads impossible, the only observable is the BUSY power-on signature, so
-the diagnostic sends the byte `0x04` (PON) under four different D/C conditions
-and watches BUSY for 400 ms each time:
-
-| Oracle | What it sends | `pon=yes` means |
-| ------ | ------------- | --------------- |
-| D (control) | `0x04` with DC=0 | the detector works (expected) |
-| A | CDI `0x50`, then `0x04` with DC=1 | a data byte executed as a command |
-| B | DSLP `0x07` + `0xA5` with DC=1, then PON | the `0xA5` never armed deep sleep |
-| E (polarity) | a lone `0x04` with DC=1 | D/C ignored, or inverted |
-
-`verdict=DC_OK` (D yes, the rest no) means the line is fine and the noise has
-another cause; `DC_NOT_SEEN` (all four yes) points at the connector — or, as
-it turned out here, at the panel power rail: a controller running on the
-leakage current of its signal lines produces exactly this result, so check
-that `[EPD-TEST] pwr gpio2=1` is in the capture before suspecting the
-hardware. `DC_INVERTED` (D no, E yes) means the sense is reversed. A pad check
-on GPIO 27/26/15/13/14 runs first, with the panel held in reset, and reports
-the read-back of each pin driven high and low (`1/0` = healthy).
+## 5. Preview the screen without hardware
 
 ```sh
-sed -i '' 's|^# CONFIG_APP_DIAG_ONLY is not set$|CONFIG_APP_DIAG_ONLY=y|' sdkconfig
-idf.py build
-tools/flash.sh --capture --timeout 40 --expect "dctest"
+tools/preview/ui_preview.sh      # → build/preview/*.png (dry, raining, stale, no data)
 ```
 
-Switch back with the reverse `sed` (`CONFIG_APP_DIAG_ONLY=y` →
-`# CONFIG_APP_DIAG_ONLY is not set`) — or `idf.py menuconfig`, menu
-"eink-weather bring-up".
+`main/ui.c` is plain C with no ESP-IDF dependency; the script compiles it for the
+host and writes PNGs. Regenerate fonts/icons after changing sizes or glyphs:
+`python3 tools/gen_assets.py` (downloads Barlow from google/fonts into `build/fonts/`).
 
-## Bring-up notes
-
-**D/C setup time: tried, and ruled out.** Waveshare's own unmodified Arduino
-demo (`epd7in5b_V2-demo`) was flashed on this exact board and panel and cleared
-the screen to a clean white, so its *data* bytes reach the controller's RAM;
-this firmware, with the same pins and the same command sequence, has only ever
-produced noise, and every oracle in `epd_diag.c` reports that the controller
-read D/C as low for the data bytes. The one visible difference was timing —
-Arduino's `digitalWrite()` costs 300–400 ns per call, `gpio_set_level()` 50–80
-ns, so both of our transports raised D/C and began clocking roughly 200 ns
-later, where the demo would have taken close to a microsecond — which would
-make the controller latch the stale D/C level (0, command) for every data byte
-and explain all seven earlier runs. So generous margins were added to both
-transports: `EPD_BB_DC_SETUP_US` / `EPD_BB_CS_SETUP_US` / `EPD_BB_CS_HOLD_US`
-in `epd_bitbang.c`, and a 5 µs delay in the SPI `pre_cb` plus
-`cs_ena_pretrans` / `cs_ena_posttrans = 2` (500 ns each at 4 MHz) in
-`epd_bus.c`. They did not help: the diagnostic still returns `DC_NOT_SEEN`,
-and so does a run at 50 µs of D/C setup and 10 µs of CS setup/hold — 2500× the
-spec's `tcds` of 20 ns — in which a lone `0x04` clocked out with D/C **high**
-and no command before it still executed as a power-on (BUSY low at 0 ms, high
-at 131 ms, the full PON signature rather than the 41 ms POF pulse). Setup time
-is therefore not the difference, the margins are kept only because they are
-correct and essentially free, and what separates this firmware from the
-Arduino demo is still unknown.
-
-## Repository layout
+## 6. Repository layout
 
 ```
-CMakeLists.txt         project definition
-sdkconfig.defaults     target, flash and console settings
-main/                  application: app_main.c, board.h, test_log.h,
-                       Kconfig.projbuild (APP_MINIMAL_DISPLAY, APP_DIAG_ONLY)
-components/gfx/        1-bpp framebuffer and drawing primitives
-                       (vendored Waveshare GUI_Paint + STM fonts, gfx_* helpers)
-components/epd_uc8179/ UC8179 panel driver: epd_bus.c (write path, plain
-                       full-duplex SPI), epd_bitbang.c (write-only GPIO
-                       transport for the diagnostics, and owner of
-                       RST/DC/BUSY and the panel power rail),
-                       epd_uc8179.c (probe, init / display /
-                       sleep sequences), epd_diag.c (D/C oracles, no refresh).
-                       Kconfig: panel variant, BUSY timeout, SPI clock,
-                       EPD_DATA_BITBANG
-tools/env.sh           sourced: activates the ESP-IDF toolchain
-tools/flash.sh         build + flash (+ optional capture)
-tools/capture.py       non-interactive UART capture for automated checks
+main/
+  app_main.c        boot: NVS → Wi-Fi → one poller cycle
+  poller.c          wake cycle, slot schedule, deep sleep, RTC drift calibration
+  wifi.c            STA connect with backoff
+  timesync.c        SNTP + timezone
+  ecowitt.c         Ecowitt API v3 client (HTTPS, cJSON)
+  display.c         panel power + refresh sequence (vendor driver glue)
+  ui.c              layout B (French), drawing primitives, text
+  ui_assets.c/.h    GENERATED 1-bit fonts and icons
+  weather.h         shared data types
+  Kconfig.projbuild settings
+  secrets.h.in      template filled from the creds files at build time
+components/crowpanel_epd/   Elecrow driver (adapted from Arduino) + compat shim
+tools/env.sh                ESP-IDF shell for this project
+tools/gen_assets.py         font/icon generator
+tools/preview/              host preview harness
+docs/                       spec, display notes, images
 ```
 
-The firmware performs **exactly one panel refresh per boot** and puts the panel
-back into deep sleep afterwards, on every exit path (Waveshare rule: a panel
-left powered is damaged by the sustained high voltage). The `APP_DIAG_ONLY`
-build performs **none**, and leaves the panel powered off and reset.
+## 7. Licenses
 
-## Log contract
-
-The firmware prints machine-readable lines prefixed with `[EPD-TEST] `
-(see `main/test_log.h`). `tools/capture.py` parses them:
-
-- `[EPD-TEST] boot chip=... mac=... idf=... reset=... heap=...` — boot banner
-- `[EPD-TEST] pwr gpio2=1 gpio33=1` — the panel power rail is up and settled.
-  Printed by both builds, immediately after the banner and before anything
-  else touches a panel pin (see the hardware section above)
-- `[EPD-TEST] probe verdict=PRESENT|ABSENT|UNCERTAIN busy_after_reset=.
-  busy_low_ms=.. busy_release_ms=..` — controller probe (one line).
-  `busy_low_ms` / `busy_release_ms` are the low-then-high BUSY signature after
-  power-on, and they are the whole verdict: `PRESENT` when the signature
-  completed (something answered a command on a pin the ESP32 pulls down, which
-  nothing absent can fake), `ABSENT` when BUSY never went low, `UNCERTAIN` when
-  it went low and never came back. The verdict is informational; the refresh is
-  attempted whatever it says.
-- `[EPD-TEST] dctest pads=dc:1/0,rst:1/0,cs:1/0,sck:1/0,mosi:1/0
-  oracleD_pon=yes oracleA_pon=no oracleB_pon=no oracleE_pon=no
-  verdict=DC_OK|DC_NOT_SEEN|DC_INVERTED|INCONCLUSIVE` — the D/C diagnostic
-  (`CONFIG_APP_DIAG_ONLY`, one line, see above). This is the *only* panel line
-  that build prints: no `init`, no `refresh_ms`, no `sleep`
-- `[EPD-TEST] init ok` — panel initialisation sequence completed
-- `[EPD-TEST] datapath=spi|bitbang` — which transport carried the image
-  (`CONFIG_EPD_DATA_BITBANG`)
-- `[EPD-TEST] refresh_ms=N` — wall-clock duration of the one full refresh
-  (≈ 15000–25000 ms on the tri-colour panel, ≈ 4000 ms would mean a b/w LUT)
-- `[EPD-TEST] sleep ok` — panel back in deep sleep
-- `[EPD-TEST] DONE` — success marker, capture stops here (exit 0)
-- `[EPD-TEST] ERROR stage=power|bus|init|display|sleep|dcdiag err=ESP_ERR_...` —
-  failure marker (exit 1); `stage=display err=ESP_ERR_TIMEOUT` means BUSY never
-  released
-- `[EPD-TEST] alive uptime=Ns heap=N` — heartbeat every 10 s
-
-Only `app_main` prints `[EPD-TEST]` lines; the driver logs through `ESP_LOG*`
-under the `epd` tag (power-on, refresh and power-off BUSY durations), so the
-two streams never interleave inside one line.
-
-Capture exit codes: 0 ok, 1 error marker, 2 timeout, 3 pyserial missing,
-4 a `--expect` substring never appeared.
+Own code: no license chosen yet (all rights reserved by the author). Barlow fonts: SIL OFL 1.1. Elecrow driver: see
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).

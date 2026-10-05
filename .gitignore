@@ -1,4 +1,5 @@
 build/
+.espressif/
 sdkconfig
 sdkconfig.old
 managed_components/
@@ -6,3 +7,8 @@ dependencies.lock
 .DS_Store
 __pycache__/
 *.pyc
+
+# Local secrets (never commit)
+wifi_creds
+ecowitt_creds
+main/secrets.h
