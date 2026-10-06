@@ -68,6 +68,15 @@ unless stated otherwise.
   Wi-Fi (~2–3 s), SNTP (≤ 5 s) and the drift; the panel was ready 24 s before the slot.
 - **Deep sleep loses RAM.** The last good observation, the pending slot and the
   drift ratio live in `RTC_DATA_ATTR` memory. A reset/flash clears it (power-on path).
+- **Do not run it from a power bank.** In deep sleep the board draws so little
+  current that power banks switch their output off (seen 2026-10-06: the panel
+  froze after 1 h 45 on a power bank; 7 h / ~28 cycles were clean on a computer
+  USB port). The e-paper keeps the last image, so a cut looks like a freeze. Use a
+  plain USB wall charger, or the Li-ion connector.
+- **Unattended-operation safety nets:** `EPD_READBUSY` gives up after 10 s (the
+  vendor loop had no exit), a 120 s cycle watchdog restarts the chip, and
+  `main/diag.c` logs on the next boot whether the previous run hung (stage) or a
+  planned wake was missed (power loss).
 - Reflashing works while the board is in deep sleep: the USB-serial bridge's
   auto-reset (RTS/DTR → EN/IO0) wakes it into the bootloader.
 

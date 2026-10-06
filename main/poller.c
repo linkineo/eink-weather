@@ -20,6 +20,7 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "diag.h"
 #include "display.h"
 #include "ecowitt.h"
 #include "poller.h"
@@ -122,6 +123,7 @@ static void deep_sleep(void)
         wake = now + SLOT_SEC;
     }
     s_rtc.sleep_start = now_s();
+    diag_sleeping(now, wake);
     double sleep_s = (wake - s_rtc.sleep_start) / s_rtc.clk_ratio;
     if (sleep_s < MIN_SLEEP_SEC) {
         sleep_s = MIN_SLEEP_SEC;
@@ -146,15 +148,20 @@ void poller_run(void)
     int64_t mono_at_rtc_now = esp_timer_get_time();
     ESP_LOGI(TAG, "%s", timer_wake ? "Timer wake" : "Power-on: fetching now");
 
+    diag_stage(DIAG_WIFI);
     status_t st = {0};
     strlcpy(st.ssid, wifi_ssid(), sizeof(st.ssid));
     st.wifi_ok = wifi_wait_connected(WIFI_TIMEOUT_MS);
     st.rssi = st.wifi_ok ? wifi_rssi() : 0;
     // SNTP starts only once the link is up: a first request sent too early is
     // lost and lwIP waits 15 s before retrying.
+    diag_stage(DIAG_SNTP);
     timesync_start();
     if (st.wifi_ok && timesync_wait_sntp(SNTP_TIMEOUT_MS) && timer_wake) {
         calibrate(rtc_now, mono_at_rtc_now);
+    }
+    if (timesync_is_valid()) {
+        diag_check_missed(time(NULL));
     }
 
     // Scheduled wake that is on time: fetch at slot - FETCH_LEAD and label with
@@ -165,6 +172,7 @@ void poller_run(void)
         sleep_until(slot - FETCH_LEAD_SEC);
     }
 
+    diag_stage(DIAG_FETCH);
     esp_err_t err = ESP_ERR_WIFI_NOT_CONNECT;
     if (st.wifi_ok) {
         weather_t w;
@@ -184,6 +192,7 @@ void poller_run(void)
     st.have_data = s_rtc.have_data;
     st.last_update = s_rtc.last_update;
 
+    diag_stage(DIAG_PANEL);
     display_init();
     display_render(&s_rtc.weather, &st);
     display_power_off();

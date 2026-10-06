@@ -31,7 +31,7 @@ rain today, solar irradiance gauge, wind direction and speed. It refreshes every
 | Panel controllers | **2 × SSD1683** (master + slave, cascaded; each drives 396 columns) |
 | Panel interface | SPI (bit-banged by the vendor driver), see pin map |
 | USB | USB-C, WCH USB-serial bridge (USB VID 0x1A86, enumerates as "USB Serial"; macOS port `/dev/cu.usbserial-*`) |
-| Power | USB-C 5 V; 3.7 V Li-ion via SH1.0 2-pin connector (on-board charger) |
+| Power | USB-C 5 V; 3.7 V Li-ion via SH1.0 2-pin connector (on-board charger). **Not from a power bank**: it cuts off during deep sleep (see display notes) |
 | Other I/O (unused) | Menu IO2, Exit IO1, rotary Up IO6 / Down IO4 / Conf IO5, TF card (MOSI IO40, MISO IO13, CLK IO39, CS IO10) |
 
 ### E-paper pin map (from the vendor driver, `components/crowpanel_epd/spi.h`)
@@ -122,6 +122,7 @@ host and writes PNGs. Regenerate fonts/icons after changing sizes or glyphs:
 main/
   app_main.c        boot: NVS → Wi-Fi → one poller cycle
   poller.c          wake cycle, slot schedule, deep sleep, RTC drift calibration
+  diag.c            post-mortem log (hang vs power loss), cycle watchdog
   wifi.c            STA connect with backoff
   timesync.c        SNTP + timezone
   ecowitt.c         Ecowitt API v3 client (HTTPS, cJSON)

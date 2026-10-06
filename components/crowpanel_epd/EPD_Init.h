@@ -21,6 +21,10 @@
 #define Gate_BITS  	 272
 #define ALLSCREEN_BYTES Source_BYTES*Gate_BITS
 
+// EPD_READBUSY gives up after this long and counts it in epd_busy_timeouts.
+#define EPD_BUSY_TIMEOUT_MS 10000
+extern volatile uint32_t epd_busy_timeouts;
+
 void EPD_READBUSY(void);
 void EPD_HW_RESET(void);
 void EPD_Update(void);

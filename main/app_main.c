@@ -5,6 +5,7 @@
 // refresh slot (see poller.c).
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "diag.h"
 #include "poller.h"
 #include "wifi.h"
 
@@ -18,6 +19,8 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    diag_boot();
 
     ESP_ERROR_CHECK(wifi_start());
     ESP_LOGI(TAG, "Refresh every %d min", CONFIG_WEATHER_POLL_MINUTES);

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.c" "wifi.c" "timesync.c" "ecowitt.c" "poller.c" "display.c" "ui.c" "ui_assets.c"
+    SRCS "app_main.c" "wifi.c" "timesync.c" "ecowitt.c" "poller.c" "display.c" "ui.c" "ui_assets.c" "diag.c"
     INCLUDE_DIRS "."
     REQUIRES crowpanel_epd driver esp_wifi esp_netif esp_event esp_timer
              esp_http_client mbedtls json nvs_flash lwip

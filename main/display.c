@@ -63,5 +63,8 @@ void display_render(const weather_t *w, const status_t *st)
     EPD_Display(ImageBW);
     EPD_FastUpdate();
     EPD_DeepSleep();
+    if (epd_busy_timeouts) {
+        ESP_LOGW(TAG, "Panel BUSY timeouts so far: %lu", (unsigned long)epd_busy_timeouts);
+    }
     ESP_LOGI(TAG, "Panel updated");
 }

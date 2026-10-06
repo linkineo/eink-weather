@@ -8,13 +8,19 @@
     入口参数:无
     说明:忙状态为1
 *******************************************************************/
+volatile uint32_t epd_busy_timeouts;
+
 void EPD_READBUSY(void)
 {
-  while (1)
+  // Bounded wait: a BUSY line stuck high must not keep the chip awake forever
+  // (the original loop had no exit). A full refresh takes ~2-3 s.
+  TickType_t start = xTaskGetTickCount();
+  while (EPD_ReadBUSY != 0)
   {
-    if (EPD_ReadBUSY == 0)
+    if (xTaskGetTickCount() - start > pdMS_TO_TICKS(EPD_BUSY_TIMEOUT_MS))
     {
-      break;
+      epd_busy_timeouts++;
+      return;
     }
     // Yield so the FreeRTOS idle task runs and the task watchdog is fed
     // during the multi-second full refresh (the original Arduino sketch
